@@ -369,13 +369,6 @@ class CuteDeviceFunctionState:
         """
         self._tma_load_role_stmt_ids.update(id(stmt) for stmt in stmts)
 
-    def is_tcgen05_tma_load_role(self, stmt: ast.stmt) -> bool:
-        return id(stmt) in self._tma_load_role_stmt_ids
-
-    @property
-    def has_tcgen05_tma_load_role_marks(self) -> bool:
-        return bool(self._tma_load_role_stmt_ids)
-
     @property
     def tcgen05_tma_load_role_stmt_ids(self) -> frozenset[int]:
         return frozenset(self._tma_load_role_stmt_ids)
@@ -383,13 +376,6 @@ class CuteDeviceFunctionState:
     def register_tcgen05_mma_exec_role_stmts(self, stmts: list[ast.AST]) -> None:
         """Mark AB consumer / UMMA / acc producer work for the MMA-exec warp."""
         self._mma_exec_role_stmt_ids.update(id(stmt) for stmt in stmts)
-
-    def is_tcgen05_mma_exec_role(self, stmt: ast.stmt) -> bool:
-        return id(stmt) in self._mma_exec_role_stmt_ids
-
-    @property
-    def has_tcgen05_mma_exec_role_marks(self) -> bool:
-        return bool(self._mma_exec_role_stmt_ids)
 
     @property
     def tcgen05_mma_exec_role_stmt_ids(self) -> frozenset[int]:
@@ -433,10 +419,6 @@ class CuteDeviceFunctionState:
 
     def is_tcgen05_epi_role_edge_tile(self, stmt: ast.stmt) -> bool:
         return id(stmt) in self._epi_role_edge_tile_stmt_ids
-
-    @property
-    def has_tcgen05_epi_role_marks(self) -> bool:
-        return bool(self._epi_role_stmt_ids)
 
     @property
     def has_tcgen05_epi_role_full_edge_split(self) -> bool:
