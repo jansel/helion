@@ -3998,5 +3998,65 @@ class TestAutotuneBudget(TestCase):
         self.assertFalse(provider._subprocess_benchmark_uses_wall_clock())
 
 
+class TestConfigValuePriors(TestCase):
+    """Backend-supplied per-key priors bias the random half of the initial
+    population (config_generation), while the other half stays uniform."""
+
+    def _add_config_gen(self) -> tuple[ConfigGeneration, object]:
+        @helion.kernel(autotune_log_level=0)
+        def add(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
+            out = torch.empty_like(a)
+            for tile in hl.tile(out.size()):
+                out[tile] = a[tile] + b[tile]
+            return out
+
+        a = torch.randn(256, 256, device=DEVICE)
+        bound = add.bind((a, a))
+        return ConfigGeneration(bound.config_spec), bound
+
+    def test_no_priors_falls_through_to_uniform(self) -> None:
+        gen, _ = self._add_config_gen()
+        # The default backend supplies no priors, so biased sampling is exactly
+        # uniform sampling and the population fill is unchanged.
+        self.assertEqual(gen._config_value_priors, {})
+        flat = gen.biased_random_flat()
+        self.assertEqual(len(flat), len(gen.flat_spec))
+
+    def test_prior_forces_value(self) -> None:
+        from helion.autotuner.config_priors import weighted_choice
+
+        _, bound = self._add_config_gen()
+        with patch.object(
+            bound.config_spec.backend,
+            "config_value_priors",
+            return_value={"num_warps": weighted_choice({4: 1.0})},
+        ):
+            gen = ConfigGeneration(bound.config_spec)
+            (warps_idx,), _is_seq = gen._key_to_flat_indices["num_warps"]
+            for _ in range(25):
+                self.assertEqual(gen.biased_random_flat()[warps_idx], 4)
+
+    def test_population_fill_is_half_biased(self) -> None:
+        from helion.autotuner.config_priors import weighted_choice
+
+        _, bound = self._add_config_gen()
+        with patch.object(
+            bound.config_spec.backend,
+            "config_value_priors",
+            return_value={"num_warps": weighted_choice({4: 1.0})},
+        ):
+            gen = ConfigGeneration(bound.config_spec)
+            with (
+                patch.object(
+                    gen, "biased_random_flat", wraps=gen.biased_random_flat
+                ) as biased,
+                patch.object(gen, "random_flat", wraps=gen.random_flat) as uniform,
+            ):
+                # 1 default + 10 random fill slots (this kernel seeds nothing).
+                gen.random_population_flat(11)
+            self.assertEqual(biased.call_count, 5)
+            self.assertEqual(uniform.call_count, 5)
+
+
 if __name__ == "__main__":
     unittest.main()
