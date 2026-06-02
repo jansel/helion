@@ -4014,10 +4014,37 @@ class TestConfigValuePriors(TestCase):
         bound = add.bind((a, a))
         return ConfigGeneration(bound.config_spec), bound
 
+    @staticmethod
+    def _forceable_slot(gen: ConfigGeneration) -> tuple[str, int, object]:
+        """Pick a config key the live kernel exposes and a value to force it to.
+
+        Backends expose different keys (e.g. the default backend has a scalar
+        ``num_warps`` slot; the cute backend exposes only sequence keys such as
+        ``block_sizes``), so the priors tests select a target dynamically rather
+        than hard-coding ``num_warps``. Returns ``(key, flat_index, value)``
+        where ``value`` is representable by the slot's fragment.
+        """
+        # Prefer a scalar ``num_warps`` slot when present: a power-of-two value
+        # in its range that won't be altered by repair logic.
+        for key, (indices, is_sequence) in gen._key_to_flat_indices.items():
+            if key == "num_warps" and not is_sequence and indices:
+                return key, indices[0], 4
+        # Otherwise use the first block-size slot, which every backend exposes.
+        block_key, (block_indices, _is_seq) = next(
+            (k, v) for k, v in gen._key_to_flat_indices.items() if k == "block_sizes"
+        )
+        flat_idx = block_indices[0]
+        fragment = gen.flat_spec[flat_idx]
+        # Use the fragment's own default: guaranteed representable and stable.
+        return block_key, flat_idx, fragment.default()
+
     def test_no_priors_falls_through_to_uniform(self) -> None:
         gen, _ = self._add_config_gen()
-        # The default backend supplies no priors, so biased sampling is exactly
-        # uniform sampling and the population fill is unchanged.
+        # With no priors, biased sampling is exactly uniform sampling and the
+        # population fill is unchanged. Control the priors explicitly rather than
+        # relying on the ambient backend default (the cute backend, for example,
+        # supplies non-empty priors).
+        gen._config_value_priors = {}
         self.assertEqual(gen._config_value_priors, {})
         flat = gen.biased_random_flat()
         self.assertEqual(len(flat), len(gen.flat_spec))
@@ -4025,37 +4052,38 @@ class TestConfigValuePriors(TestCase):
     def test_prior_forces_value(self) -> None:
         from helion.autotuner.config_priors import weighted_choice
 
-        _, bound = self._add_config_gen()
-        with patch.object(
-            bound.config_spec.backend,
-            "config_value_priors",
-            return_value={"num_warps": weighted_choice({4: 1.0})},
+        gen, _ = self._add_config_gen()
+        key, flat_idx, value = self._forceable_slot(gen)
+        # Control the priors directly on the instance so the test is independent
+        # of whatever priors the active backend supplies.
+        gen._config_value_priors = {key: weighted_choice({value: 1.0})}
+        # Disable size repair/shrink so the forced value is observed verbatim.
+        with (
+            patch.object(gen, "shrink_config", lambda *a, **k: None),
+            patch.object(gen, "_repair_cute_num_threads", lambda *a, **k: None),
         ):
-            gen = ConfigGeneration(bound.config_spec)
-            (warps_idx,), _is_seq = gen._key_to_flat_indices["num_warps"]
             for _ in range(25):
-                self.assertEqual(gen.biased_random_flat()[warps_idx], 4)
+                self.assertEqual(gen.biased_random_flat()[flat_idx], value)
 
     def test_population_fill_is_half_biased(self) -> None:
         from helion.autotuner.config_priors import weighted_choice
 
-        _, bound = self._add_config_gen()
-        with patch.object(
-            bound.config_spec.backend,
-            "config_value_priors",
-            return_value={"num_warps": weighted_choice({4: 1.0})},
+        gen, _ = self._add_config_gen()
+        key, _flat_idx, value = self._forceable_slot(gen)
+        gen._config_value_priors = {key: weighted_choice({value: 1.0})}
+        with (
+            # Suppress backend-supplied compiler seeds so the random-fill count
+            # is deterministic across backends (cute seeds a few configs).
+            patch.object(gen, "seed_flat_config_pairs", return_value=[]),
+            patch.object(
+                gen, "biased_random_flat", wraps=gen.biased_random_flat
+            ) as biased,
+            patch.object(gen, "random_flat", wraps=gen.random_flat) as uniform,
         ):
-            gen = ConfigGeneration(bound.config_spec)
-            with (
-                patch.object(
-                    gen, "biased_random_flat", wraps=gen.biased_random_flat
-                ) as biased,
-                patch.object(gen, "random_flat", wraps=gen.random_flat) as uniform,
-            ):
-                # 1 default + 10 random fill slots (this kernel seeds nothing).
-                gen.random_population_flat(11)
-            self.assertEqual(biased.call_count, 5)
-            self.assertEqual(uniform.call_count, 5)
+            # 1 default + 10 random fill slots (seeds suppressed above).
+            gen.random_population_flat(11)
+        self.assertEqual(biased.call_count, 5)
+        self.assertEqual(uniform.call_count, 5)
 
 
 if __name__ == "__main__":
