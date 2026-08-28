@@ -1,0 +1,122 @@
+# Optimized by KernelAgent-Oink(https://github.com/meta-pytorch/KernelAgent)
+import torch
+import cutlass
+import cutlass.cute as cute
+import cutlass.pipeline as pipeline
+import cutlass.utils as utils
+import cutlass.utils.blackwell_helpers as sm100_utils
+from cutlass.cute.nvgpu import cpasync,tcgen05
+from cutlass.cute.runtime import from_dlpack
+io_dtype=cutlass.Float16;acc_dtype=cutlass.Float32
+S=262144;D=64;BH=64;BM=128;BN=256;NQ=S//BM;NK=S//BN;threads_per_cta=1024
+qk_tiler=(128,256,64);pv_tiler=(128,64,256)
+@cute.struct
+class SharedStorage:
+ q_mbar:cute.struct.MemRange[cutlass.Int64,2]
+ k_mbar:cute.struct.MemRange[cutlass.Int64,2]
+ v_mbar:cute.struct.MemRange[cutlass.Int64,2]
+ acc_mbar:cute.struct.MemRange[cutlass.Int64,2]
+ tmem_holding:cutlass.Int32
+@cute.kernel
+def attention_kernel(qk_mma:cute.TiledMma,pv_mma:cute.TiledMma,q_atom:cute.CopyAtom,q:cute.Tensor,k_atom:cute.CopyAtom,k:cute.Tensor,v_atom:cute.CopyAtom,v:cute.Tensor,o:cute.Tensor,q_layout:cute.ComposedLayout,k_layout:cute.ComposedLayout,v_layout:cute.ComposedLayout,p_layout:cute.ComposedLayout):
+ tidx,_,_=cute.arch.thread_idx();warp_idx=cute.arch.make_warp_uniform(cute.arch.warp_idx());grid_qb,head,_=cute.arch.block_idx();qb=NQ-1-grid_qb;qtile=head*NQ+qb;row=tidx//8;part=tidx%8;copy_tid=tidx%128
+ smem=utils.SmemAllocator();storage=smem.allocate(SharedStorage)
+ sQ=smem.allocate_tensor(io_dtype,q_layout.outer,byte_alignment=128,swizzle=q_layout.inner);sScore=smem.allocate_tensor(acc_dtype,cute.make_layout((BM,BN),stride=(BN,1)),byte_alignment=128);raw=cute.make_ptr(io_dtype,sScore.iterator.llvm_ptr,cute.AddressSpace.smem,assumed_align=128);vptr=cute.make_ptr(io_dtype,raw.llvm_ptr,cute.AddressSpace.smem,assumed_align=128,swizzle_=v_layout.inner);sV=cute.make_tensor(vptr,v_layout.outer);sP=smem.allocate_tensor(io_dtype,p_layout.outer,byte_alignment=128,swizzle=p_layout.inner);praw=cute.make_ptr(io_dtype,sP.iterator.llvm_ptr,cute.AddressSpace.smem,assumed_align=128);kptr=cute.make_ptr(io_dtype,praw.llvm_ptr,cute.AddressSpace.smem,assumed_align=128,swizzle_=k_layout.inner);sK=cute.make_tensor(kptr,k_layout.outer);sO=cute.make_tensor(sScore.iterator,cute.make_layout((BM,D),stride=(D,1)))
+ if warp_idx==0:cpasync.prefetch_descriptor(q_atom);cpasync.prefetch_descriptor(k_atom);cpasync.prefetch_descriptor(v_atom)
+ qprod,qcons=pipeline.PipelineTmaUmma.create(num_stages=1,producer_group=pipeline.CooperativeGroup(pipeline.Agent.Thread),consumer_group=pipeline.CooperativeGroup(pipeline.Agent.Thread),tx_count=cute.size_in_bytes(io_dtype,cute.select(q_layout,mode=[0,1,2])),barrier_storage=storage.q_mbar.data_ptr()).make_participants();kprod,kcons=pipeline.PipelineTmaUmma.create(num_stages=1,producer_group=pipeline.CooperativeGroup(pipeline.Agent.Thread),consumer_group=pipeline.CooperativeGroup(pipeline.Agent.Thread),tx_count=cute.size_in_bytes(io_dtype,cute.select(k_layout,mode=[0,1,2])),barrier_storage=storage.k_mbar.data_ptr()).make_participants();vprod,vcons=pipeline.PipelineTmaUmma.create(num_stages=1,producer_group=pipeline.CooperativeGroup(pipeline.Agent.Thread),consumer_group=pipeline.CooperativeGroup(pipeline.Agent.Thread),tx_count=cute.size_in_bytes(io_dtype,cute.select(v_layout,mode=[0,1,2])),barrier_storage=storage.v_mbar.data_ptr()).make_participants();accprod,acccons=pipeline.PipelineUmmaAsync.create(num_stages=1,producer_group=pipeline.CooperativeGroup(pipeline.Agent.Thread),consumer_group=pipeline.CooperativeGroup(pipeline.Agent.Thread,threads_per_cta),barrier_storage=storage.acc_mbar.data_ptr()).make_participants()
+ gQ=cute.local_tile(q,qk_tiler,(qtile,0,None),proj=(1,None,1));gK=cute.local_tile(k,qk_tiler,(0,None,None),proj=(None,1,1));gV=cute.local_tile(v,pv_tiler,(0,0,None),proj=(None,1,1));qk_thr=qk_mma.get_slice(0);pv_thr=pv_mma.get_slice(0)
+ tCgQ=qk_thr.partition_A(gQ);tCgK=qk_thr.partition_B(gK);tCgV=pv_thr.partition_B(gV);tCrQ=qk_mma.make_fragment_A(sQ);tCrK=qk_mma.make_fragment_B(sK);tCtS=qk_mma.make_fragment_C(qk_mma.partition_shape_C(qk_tiler[:2]));tCrP=pv_mma.make_fragment_A(sP);tCrV=pv_mma.make_fragment_B(sV);tCtO=pv_mma.make_fragment_C(pv_mma.partition_shape_C(pv_tiler[:2]))
+ tQsQ,tQgQ=cute.nvgpu.cpasync.tma_partition(q_atom,0,cute.make_layout(1),cute.group_modes(sQ,0,3),cute.group_modes(tCgQ,0,3));tKsK,tKgK=cute.nvgpu.cpasync.tma_partition(k_atom,0,cute.make_layout(1),cute.group_modes(sK,0,3),cute.group_modes(tCgK,0,3));tVsV,tVgV=cute.nvgpu.cpasync.tma_partition(v_atom,0,cute.make_layout(1),cute.group_modes(sV,0,3),cute.group_modes(tCgV,0,3))
+ tmem=utils.TmemAllocator(storage.tmem_holding,barrier_for_retrieve=pipeline.NamedBarrier(1,threads_per_cta));tmem.allocate(256);tmem.wait_for_alloc();tmem_ptr=tmem.retrieve_ptr(acc_dtype);tCtS=cute.make_tensor(tmem_ptr,tCtS.layout);tCtO=cute.make_tensor(tmem_ptr,tCtO.layout)
+ tCsS=qk_thr.partition_C(sScore);s_epi=((cute.size(tCtS,mode=[0,0]),cute.size(tCtS,mode=[0,1])//8),);tCtS_epi=cute.zipped_divide(tCtS,s_epi);tCsS_epi=cute.zipped_divide(tCsS,s_epi);s_copy=tcgen05.make_tmem_copy(cute.make_copy_atom(tcgen05.Ld32x32bOp(tcgen05.Repetition.x32),acc_dtype),tCtS_epi[None,0]);s_thr=s_copy.get_slice(copy_tid);tStS=s_thr.partition_S(tCtS_epi);tSsS=s_thr.partition_D(tCsS_epi);rS=cute.make_rmem_tensor(tSsS[None,None,0].shape,acc_dtype)
+ tCsO=pv_thr.partition_C(sO);o_epi=((cute.size(tCtO,mode=[0,0]),cute.size(tCtO,mode=[0,1])//2),);tCtO_epi=cute.zipped_divide(tCtO,o_epi);tCsO_epi=cute.zipped_divide(tCsO,o_epi);o_copy=tcgen05.make_tmem_copy(cute.make_copy_atom(tcgen05.Ld32x32bOp(tcgen05.Repetition.x32),acc_dtype),tCtO_epi[None,0]);o_thr=o_copy.get_slice(copy_tid);tOtO=o_thr.partition_S(tCtO_epi);tOsO=o_thr.partition_D(tCsO_epi);rTmpO=cute.make_rmem_tensor(tOsO[None,None,0].shape,acc_dtype);rOut=cute.make_rmem_tensor(cute.make_layout(8),acc_dtype)
+ for d in cutlass.range_constexpr(8):rOut[d]=0.0
+ running_m=-1.0e30;running_l=0.0
+ if warp_idx==0:
+  qe=qprod.acquire_and_advance();cute.copy(q_atom,tQgQ[(None,0)],tQsQ[(None,qe.index)],tma_bar_ptr=qe.barrier);ke=kprod.acquire_and_advance();cute.copy(k_atom,tKgK[(None,head*NK,0)],tKsK[(None,ke.index)],tma_bar_ptr=ke.barrier);qf=qcons.wait_and_advance();kf=kcons.wait_and_advance();qf.release();kf.release()
+ nt=qb//2+1
+ for kb in cutlass.range(nt):
+  ktile=head*NK+kb
+  if warp_idx==0:
+   ae=accprod.acquire_and_advance();qk_mma.set(tcgen05.Field.ACCUMULATE,False)
+   for kk in cutlass.range_constexpr(cute.size(tCrQ,mode=[2])):
+    cute.gemm(qk_mma,tCtS,tCrQ[(None,None,kk,0)],tCrK[(None,None,kk,0)],tCtS);qk_mma.set(tcgen05.Field.ACCUMULATE,True)
+   ae.commit()
+  af=acccons.wait_and_advance()
+  if tidx<128:cute.copy(s_copy,tStS[None,None,0],rS);rS.store(rS.load()*0.125);cute.autovec_copy(rS,tSsS[None,None,0])
+  if tidx>=128 and tidx<256:cute.copy(s_copy,tStS[None,None,1],rS);rS.store(rS.load()*0.125);cute.autovec_copy(rS,tSsS[None,None,1])
+  if tidx>=256 and tidx<384:cute.copy(s_copy,tStS[None,None,2],rS);rS.store(rS.load()*0.125);cute.autovec_copy(rS,tSsS[None,None,2])
+  if tidx>=384 and tidx<512:cute.copy(s_copy,tStS[None,None,3],rS);rS.store(rS.load()*0.125);cute.autovec_copy(rS,tSsS[None,None,3])
+  if tidx>=512 and tidx<640:cute.copy(s_copy,tStS[None,None,4],rS);rS.store(rS.load()*0.125);cute.autovec_copy(rS,tSsS[None,None,4])
+  if tidx>=640 and tidx<768:cute.copy(s_copy,tStS[None,None,5],rS);rS.store(rS.load()*0.125);cute.autovec_copy(rS,tSsS[None,None,5])
+  if tidx>=768 and tidx<896:cute.copy(s_copy,tStS[None,None,6],rS);rS.store(rS.load()*0.125);cute.autovec_copy(rS,tSsS[None,None,6])
+  if tidx>=896:cute.copy(s_copy,tStS[None,None,7],rS);rS.store(rS.load()*0.125);cute.autovec_copy(rS,tSsS[None,None,7])
+  af.release();cute.arch.sync_threads();m0=-1.0e30;m1=-1.0e30;m2=-1.0e30;m3=-1.0e30;m4=-1.0e30;m5=-1.0e30;m6=-1.0e30;m7=-1.0e30
+  for jj in cutlass.range_constexpr(4):
+   base=part+jj*64;j=base;x=sScore[(row,j)]
+   if kb*BN+j>qb*BM+row:x=-1.0e30
+   if x>m0:m0=x
+   j=base+8;x=sScore[(row,j)]
+   if kb*BN+j>qb*BM+row:x=-1.0e30
+   if x>m1:m1=x
+   j=base+16;x=sScore[(row,j)]
+   if kb*BN+j>qb*BM+row:x=-1.0e30
+   if x>m2:m2=x
+   j=base+24;x=sScore[(row,j)]
+   if kb*BN+j>qb*BM+row:x=-1.0e30
+   if x>m3:m3=x
+   j=base+32;x=sScore[(row,j)]
+   if kb*BN+j>qb*BM+row:x=-1.0e30
+   if x>m4:m4=x
+   j=base+40;x=sScore[(row,j)]
+   if kb*BN+j>qb*BM+row:x=-1.0e30
+   if x>m5:m5=x
+   j=base+48;x=sScore[(row,j)]
+   if kb*BN+j>qb*BM+row:x=-1.0e30
+   if x>m6:m6=x
+   j=base+56;x=sScore[(row,j)]
+   if kb*BN+j>qb*BM+row:x=-1.0e30
+   if x>m7:m7=x
+  local_m=m0
+  if m1>local_m:local_m=m1
+  if m2>local_m:local_m=m2
+  if m3>local_m:local_m=m3
+  if m4>local_m:local_m=m4
+  if m5>local_m:local_m=m5
+  if m6>local_m:local_m=m6
+  if m7>local_m:local_m=m7
+  block_m=cute.arch.warp_reduction_max(val=local_m,threads_in_group=8);local_l0=0.0;local_l1=0.0
+  for jj in cutlass.range_constexpr(8):
+   j0=part+jj*32;j1=j0+8;j2=j0+16;j3=j0+24;x0=sScore[(row,j0)];x1=sScore[(row,j1)];x2=sScore[(row,j2)];x3=sScore[(row,j3)];e0,e1=cute.arch.exp_packed_f32x2((x0-block_m,x1-block_m));e2,e3=cute.arch.exp_packed_f32x2((x2-block_m,x3-block_m))
+   if kb*BN+j0>qb*BM+row:e0=0.0
+   if kb*BN+j1>qb*BM+row:e1=0.0
+   if kb*BN+j2>qb*BM+row:e2=0.0
+   if kb*BN+j3>qb*BM+row:e3=0.0
+   local_l0=local_l0+e0+e1;local_l1=local_l1+e2+e3;pc0=cute.idx2crd(row+j0*BM,sP.shape);pc1=cute.idx2crd(row+j1*BM,sP.shape);pc2=cute.idx2crd(row+j2*BM,sP.shape);pc3=cute.idx2crd(row+j3*BM,sP.shape);sP[pc0]=io_dtype(e0);sP[pc1]=io_dtype(e1);sP[pc2]=io_dtype(e2);sP[pc3]=io_dtype(e3)
+  local_l=local_l0+local_l1;block_l=cute.arch.warp_reduction_sum(val=local_l,threads_in_group=8);cute.arch.sync_threads()
+  if warp_idx==0:
+   ve=vprod.acquire_and_advance();cute.copy(v_atom,tVgV[(None,ktile)],tVsV[(None,ve.index)],tma_bar_ptr=ve.barrier);vf=vcons.wait_and_advance();ae=accprod.acquire_and_advance();pv_mma.set(tcgen05.Field.ACCUMULATE,False)
+   for kk in cutlass.range_constexpr(cute.size(tCrP,mode=[2])):
+    cute.gemm(pv_mma,tCtO,tCrP[(None,None,kk)],tCrV[(None,None,kk,0)],tCtO);pv_mma.set(tcgen05.Field.ACCUMULATE,True)
+   ae.commit();vf.release()
+  af=acccons.wait_and_advance()
+  if warp_idx==0:
+   if kb+1<nt:
+    ke=kprod.acquire_and_advance();cute.copy(k_atom,tKgK[(None,head*NK+kb+1,0)],tKsK[(None,ke.index)],tma_bar_ptr=ke.barrier);kf=kcons.wait_and_advance();kf.release()
+  if tidx>=128 and tidx<256:cute.copy(o_copy,tOtO[None,None,0],rTmpO);cute.autovec_copy(rTmpO,tOsO[None,None,0])
+  if tidx>=256 and tidx<384:cute.copy(o_copy,tOtO[None,None,1],rTmpO);cute.autovec_copy(rTmpO,tOsO[None,None,1])
+  af.release();cute.arch.sync_threads();new_m=running_m
+  if block_m>new_m:new_m=block_m
+  alpha,beta=cute.arch.exp_packed_f32x2((running_m-new_m,block_m-new_m))
+  for dd in cutlass.range_constexpr(8):
+   d=part+dd*8;rOut[dd]=alpha*rOut[dd]+beta*sO[(row,d)]
+  running_l=alpha*running_l+beta*block_l;running_m=new_m;cute.arch.sync_threads()
+ outrow=head*S+qb*BM+row
+ for dd in cutlass.range_constexpr(8):
+  d=part+dd*8;o[(outrow,d)]=io_dtype(rOut[dd]/running_l)
+ tmem.relinquish_alloc_permit();pipeline.sync(barrier_id=1);tmem.free(tmem_ptr)
+@cute.jit
+def attention_host(q:cute.Tensor,k:cute.Tensor,v:cute.Tensor,o:cute.Tensor):
+ qk_mma=cute.make_tiled_mma(tcgen05.MmaF16BF16Op(io_dtype,acc_dtype,(128,256,16),tcgen05.CtaGroup.ONE,tcgen05.OperandSource.SMEM,tcgen05.OperandMajorMode.K,tcgen05.OperandMajorMode.K));pv_mma=cute.make_tiled_mma(tcgen05.MmaF16BF16Op(io_dtype,acc_dtype,(128,64,16),tcgen05.CtaGroup.ONE,tcgen05.OperandSource.SMEM,tcgen05.OperandMajorMode.K,tcgen05.OperandMajorMode.MN));q_layout=sm100_utils.make_smem_layout_a(qk_mma,qk_tiler,io_dtype,1);k_layout=sm100_utils.make_smem_layout_b(qk_mma,qk_tiler,io_dtype,1);v_layout=sm100_utils.make_smem_layout_b(pv_mma,pv_tiler,io_dtype,1);p_layout=cute.select(sm100_utils.make_smem_layout_a(pv_mma,pv_tiler,io_dtype,1),mode=[0,1,2]);op=cute.nvgpu.cpasync.CopyBulkTensorTileG2SOp(tcgen05.CtaGroup.ONE);qa,qt=cute.nvgpu.make_tiled_tma_atom_A(op,q,cute.select(q_layout,mode=[0,1,2]),qk_tiler,qk_mma);ka,kt=cute.nvgpu.make_tiled_tma_atom_B(op,k,cute.select(k_layout,mode=[0,1,2]),qk_tiler,qk_mma);va,vt=cute.nvgpu.make_tiled_tma_atom_B(op,v,cute.select(v_layout,mode=[0,1,2]),pv_tiler,pv_mma);attention_kernel(qk_mma,pv_mma,qa,qt,ka,kt,va,vt,o,q_layout,k_layout,v_layout,p_layout).launch(grid=(NQ,BH,1),block=(threads_per_cta,1,1))
+def kernel_function(q,k,v):
+ out=torch.empty_like(q);attention_host(from_dlpack(q.view(BH*S,D),assumed_align=32),from_dlpack(k.view(BH*S,D),assumed_align=32),from_dlpack(v.view(BH*S,D).t(),assumed_align=32),from_dlpack(out.view(BH*S,D),assumed_align=32));return out

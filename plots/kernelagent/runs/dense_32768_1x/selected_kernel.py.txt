@@ -1,0 +1,185 @@
+"""
+Fused multi-head scaled-dot-product attention (forward pass), 100% Triton.
+
+Everything below is fused into ONE kernel launch (one program per
+(query-tile, batch*head) pair):
+
+    stage 1: load Q tile (kept resident in registers/SRAM)
+    stage 2: stream K tiles -> S = Q @ K^T   (tl.dot, fp32 accumulate)
+    stage 3: * (1/sqrt(d) * log2(e))         (folded scale, enables exp2)
+    stage 4: online streaming normalization  (running max m_i, running sum l_i,
+             rescale of the output accumulator by exp2(m_old - m_new))
+    stage 5: O += P @ V                      (second tl.dot into same accumulator)
+    stage 6: epilogue  O /= l_i  -> cast to output dtype -> store
+
+No intermediate S / P matrix is ever written to global memory, so no further
+kernel splitting or additional fusion is possible: the whole dependent chain
+already lives in a single pass.  The Python wrapper performs no arithmetic on
+tensor data -- only shape/dtype/device validation, output allocation and grid
+computation.
+"""
+
+from __future__ import annotations
+
+import torch
+import triton
+import triton.language as tl
+
+
+# ----------------------------------------------------------------------------------
+# Triton kernel
+# ----------------------------------------------------------------------------------
+@triton.jit
+def _attn_fwd(
+    Q, K, V, Out,                                  # pointers
+    stride_qz, stride_qh, stride_qm, stride_qd,    # Q strides
+    stride_kz, stride_kh, stride_kn, stride_kd,    # K strides
+    stride_vz, stride_vh, stride_vn, stride_vd,    # V strides
+    stride_oz, stride_oh, stride_om, stride_od,    # Out strides
+    H,                                             # number of heads
+    N_CTX_Q, N_CTX_K,                              # sequence lengths
+    HEAD_DIM: tl.constexpr,
+    BLOCK_M: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    EVEN_N: tl.constexpr,                          # N_CTX_K % BLOCK_N == 0
+    EVEN_M: tl.constexpr,                          # N_CTX_Q % BLOCK_M == 0
+):
+    """One program computes a BLOCK_M x HEAD_DIM tile of the attention output."""
+    start_m = tl.program_id(0)          # query tile index
+    off_hz = tl.program_id(1)           # flattened (batch, head) index
+    off_z = off_hz // H
+    off_h = off_hz % H
+
+    # ---- base pointers for this (batch, head) ------------------------------------
+    q_base = Q + off_z.to(tl.int64) * stride_qz + off_h.to(tl.int64) * stride_qh
+    k_base = K + off_z.to(tl.int64) * stride_kz + off_h.to(tl.int64) * stride_kh
+    v_base = V + off_z.to(tl.int64) * stride_vz + off_h.to(tl.int64) * stride_vh
+    o_base = Out + off_z.to(tl.int64) * stride_oz + off_h.to(tl.int64) * stride_oh
+
+    offs_m = start_m * BLOCK_M + tl.arange(0, BLOCK_M)
+    offs_n = tl.arange(0, BLOCK_N)
+    offs_d = tl.arange(0, HEAD_DIM)
+
+    # ---- stage 1: load the query tile --------------------------------------------
+    q_ptrs = q_base + offs_m[:, None].to(tl.int64) * stride_qm + offs_d[None, :] * stride_qd
+    if EVEN_M:
+        q = tl.load(q_ptrs)
+    else:
+        q = tl.load(q_ptrs, mask=offs_m[:, None] < N_CTX_Q, other=0.0)
+
+    # running statistics (fp32 for numerical stability) + fp32 output accumulator
+    m_i = tl.full([BLOCK_M], float("-inf"), dtype=tl.float32)
+    l_i = tl.zeros([BLOCK_M], dtype=tl.float32)
+    acc = tl.zeros([BLOCK_M, HEAD_DIM], dtype=tl.float32)
+
+    # 1/sqrt(d) folded with log2(e) so the faster exp2 instruction can be used.
+    # Compile-time constant folding (HEAD_DIM is a tl.constexpr python int).
+    qk_scale = 1.4426950408889634 / (HEAD_DIM ** 0.5)
+
+    # ---- stages 2-5: stream over key/value tiles ---------------------------------
+    for start_n in range(0, N_CTX_K, BLOCK_N):
+        start_n = tl.multiple_of(start_n, BLOCK_N)
+        curr_n = start_n + offs_n
+        k_ptrs = k_base + curr_n[:, None].to(tl.int64) * stride_kn + offs_d[None, :] * stride_kd
+        v_ptrs = v_base + curr_n[:, None].to(tl.int64) * stride_vn + offs_d[None, :] * stride_vd
+
+        if EVEN_N:
+            k = tl.load(k_ptrs)
+            v = tl.load(v_ptrs)
+        else:
+            n_mask = curr_n[:, None] < N_CTX_K
+            k = tl.load(k_ptrs, mask=n_mask, other=0.0)
+            v = tl.load(v_ptrs, mask=n_mask, other=0.0)
+
+        # S = Q @ K^T  (tensor cores, fp32 accumulate), then folded scale
+        qk = tl.dot(q, tl.trans(k)).to(tl.float32) * qk_scale
+
+        if not EVEN_N:
+            # keys past the end must not contribute to the normalization
+            qk = tl.where(curr_n[None, :] < N_CTX_K, qk, float("-inf"))
+
+        # online (streaming) softmax update
+        m_new = tl.maximum(m_i, tl.max(qk, 1))
+        # guard against an all -inf row (possible only in fully-masked tiles)
+        m_safe = tl.where(m_new == float("-inf"), 0.0, m_new)
+        p = tl.math.exp2(qk - m_safe[:, None])
+        alpha = tl.math.exp2(m_i - m_safe)          # rescale factor for old state
+        l_i = l_i * alpha + tl.sum(p, 1)
+        acc = acc * alpha[:, None]
+
+        # O += P @ V  (accumulate directly into the same fp32 accumulator)
+        acc = tl.dot(p.to(k.dtype), v, acc)
+        m_i = m_new
+
+    # ---- stage 6: epilogue -- normalize, cast, store ------------------------------
+    l_safe = tl.where(l_i > 0.0, l_i, 1.0)
+    acc = acc / l_safe[:, None]
+
+    o_ptrs = o_base + offs_m[:, None].to(tl.int64) * stride_om + offs_d[None, :] * stride_od
+    if EVEN_M:
+        tl.store(o_ptrs, acc.to(Out.dtype.element_ty))
+    else:
+        tl.store(o_ptrs, acc.to(Out.dtype.element_ty), mask=offs_m[:, None] < N_CTX_Q)
+
+
+# ----------------------------------------------------------------------------------
+# Python wrapper: validation / allocation / launch only (no math on tensor data)
+# ----------------------------------------------------------------------------------
+def kernel_function(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor) -> torch.Tensor:
+    """
+    Non-causal fused attention.
+
+    Args:
+        q, k, v: [batch, heads, seq_len, head_dim] CUDA tensors (fp16 / bf16 / fp32).
+
+    Returns:
+        Output tensor with the same shape / dtype as `q`.
+    """
+    # ---------------------------- validation ----------------------------
+    if q.dim() != 4 or k.dim() != 4 or v.dim() != 4:
+        raise ValueError("q, k, v must be 4-D [batch, heads, seq, head_dim] tensors")
+    if not (q.is_cuda and k.is_cuda and v.is_cuda):
+        raise ValueError("all inputs must live on a CUDA device")
+    if q.dtype != k.dtype or q.dtype != v.dtype:
+        raise ValueError("q, k, v must share the same dtype")
+
+    Z, H, N_CTX_Q, HEAD_DIM = q.shape
+    Zk, Hk, N_CTX_K, Dk = k.shape
+    Zv, Hv, N_CTX_V, Dv = v.shape
+    if (Zk, Hk, Dk) != (Z, H, HEAD_DIM) or (Zv, Hv, Dv) != (Z, H, HEAD_DIM):
+        raise ValueError("q, k, v must agree on batch, heads and head_dim")
+    if N_CTX_K != N_CTX_V:
+        raise ValueError("k and v must have the same sequence length")
+    if HEAD_DIM not in (16, 32, 64, 128, 256):
+        raise ValueError(f"unsupported head_dim {HEAD_DIM}")
+
+    # allocation only
+    out = torch.empty_like(q)
+
+    # ---------------------------- launch configuration ----------------------------
+    if HEAD_DIM <= 64:
+        BLOCK_M, BLOCK_N, num_warps, num_stages = 128, 64, 4, 3
+    elif HEAD_DIM <= 128:
+        BLOCK_M, BLOCK_N, num_warps, num_stages = 128, 64, 8, 3
+    else:
+        BLOCK_M, BLOCK_N, num_warps, num_stages = 64, 64, 8, 2
+
+    grid = (triton.cdiv(N_CTX_Q, BLOCK_M), Z * H, 1)
+
+    _attn_fwd[grid](
+        q, k, v, out,
+        q.stride(0), q.stride(1), q.stride(2), q.stride(3),
+        k.stride(0), k.stride(1), k.stride(2), k.stride(3),
+        v.stride(0), v.stride(1), v.stride(2), v.stride(3),
+        out.stride(0), out.stride(1), out.stride(2), out.stride(3),
+        H,
+        N_CTX_Q, N_CTX_K,
+        HEAD_DIM=HEAD_DIM,
+        BLOCK_M=BLOCK_M,
+        BLOCK_N=BLOCK_N,
+        EVEN_N=(N_CTX_K % BLOCK_N == 0),
+        EVEN_M=(N_CTX_Q % BLOCK_M == 0),
+        num_warps=num_warps,
+        num_stages=num_stages,
+    )
+    return out

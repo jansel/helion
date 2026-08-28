@@ -1,0 +1,19 @@
+{
+  "config": "{\n  \"block_sizes\": [\n    1,\n    128,\n    128\n  ],\n  \"cute_flash_s_stage\": 2,\n  \"cute_flash_kv_stage\": 2,\n  \"cute_flash_persistent\": false,\n  \"cute_flash_persistent_ctas_per_sm\": 1,\n  \"cute_flash_recompute_tile_coords\": false,\n  \"cute_flash_e2e_schedule\": \"8/2\",\n  \"cute_flash_masked_e2e_schedule\": \"8/2\",\n  \"cute_flash_e2e_offset\": 4,\n  \"cute_flash_e2e_offset0\": 3,\n  \"cute_flash_exp2_packet\": \"1x1\",\n  \"cute_flash_mma_interleave\": true,\n  \"cute_flash_wait_hint\": 10000000,\n  \"cute_flash_stat_transport\": \"ring2\",\n  \"cute_flash_pipeline_family\": \"fa4\",\n  \"cute_flash_softmax_disc\": true,\n  \"cute_flash_disc_pipe\": 3,\n  \"cute_flash_split_p_arrive\": true,\n  \"cute_flash_p_store_rep\": 16,\n  \"cute_flash_s_load_rep\": 32,\n  \"cute_flash_precompute_qk_desc\": false,\n  \"cute_flash_first_load_order\": 0,\n  \"cute_flash_kv_order\": \"ascending\",\n  \"cute_flash_epi_tma\": false,\n  \"cute_flash_epi_stg\": false,\n  \"cute_flash_epi_stg_store\": \"slice\",\n  \"cute_flash_epi_stg_gmem\": \"stage\",\n  \"cute_flash_rescale_threshold\": 8.0,\n  \"cute_flash_skip_rescale_stats\": false,\n  \"cute_flash_rescale_chunk_cols\": 16,\n  \"cute_flash_softmax_regs\": 184,\n  \"cute_flash_corr_regs\": 64,\n  \"cute_flash_other_regs\": 48,\n  \"cute_flash_corr_tile_size\": 8,\n  \"cute_flash_packed_reduce\": true,\n  \"cute_flash_small_biased\": true,\n  \"cute_flash_causal_lpt_swizzle\": 1,\n  \"cute_flash_causal_kv_order\": \"descending\",\n  \"cute_flash_role_map\": \"helion\",\n  \"cute_flash_clc_heads_per_batch\": 0,\n  \"cute_flash_clc_pdl\": false,\n  \"cute_flash_clc_stages\": 1,\n  \"cute_flash_causal_loop_split\": true,\n  \"cute_flash_q_tile_count\": 2\n}",
+  "key": {
+    "type": "LooseAutotuneCacheKey",
+    "fields": {
+      "specialization_key": "((torch.float16, torch.Size([2, 32, 262144, 64]), (536870912, 16777216, 64, 1), frozenset()), (torch.float16, torch.Size([2, 32, 262144, 64]), (536870912, 16777216, 64, 1), frozenset()), (torch.float16, torch.Size([2, 32, 262144, 64]), (536870912, 16777216, 64, 1), frozenset()), 'cuda', (10, 0), False)",
+      "extra_results": "()",
+      "kernel_source_hash": "e3c74a90f965e679cc7fefc75e8327ae87110c9fb09477a0dbe7a1c46018e80f",
+      "hardware": "NVIDIA B200",
+      "runtime_name": "13.0",
+      "backend": "cute",
+      "config_spec_hash": "8fcf13efc65972f71744a7f49442f19d24481e7b03346a671d6a90a946fcc7d0",
+      "extra_cache_key": "",
+      "best_of_k": "1"
+    }
+  },
+  "flat_config": "[1, 128, 128, 2, 2, false, 1, false, \"8/2\", \"8/2\", 4, 3, \"1x1\", true, 10000000, \"ring2\", \"fa4\", true, 3, true, 16, 32, false, 0, \"ascending\", false, false, \"slice\", \"stage\", 8.0, false, 16, 184, 64, 48, 8, true, true, 1, \"descending\", \"helion\", 0, false, 1, true]",
+  "backend_cache_key": "UNVUIAGZ5QVIPFSVFHFMIZJEEVIVFSKSH4MXZOGF6DBGFX25K3ZA"
+}

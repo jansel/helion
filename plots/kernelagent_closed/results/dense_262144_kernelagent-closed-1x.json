@@ -1,0 +1,58 @@
+{
+  "accuracy": "PASS",
+  "benchmark_timer": "event",
+  "best_ms": 2727.321533203125,
+  "best_tflops": 412.8225781726226,
+  "config": {
+    "budget_label": "1x",
+    "budget_seconds": 3682.7,
+    "elapsed_seconds": 3682.8138315677643,
+    "selection": {
+      "candidate_id": 18,
+      "hypothesis": "Eight independent partial maxima reduce the row-max dependency chain from 128 to 16 operations plus an eight-term reduction.",
+      "median_ms": 2726.993896484375,
+      "mutation_family": "softmax-max-ilp",
+      "source_sha256": "3c73e42060837b2875cefa88d1482798ed558c5ddbb40dd8dcffb98aa4e81582",
+      "tflops": 412.87217704965445
+    },
+    "source_sha256": "3c73e42060837b2875cefa88d1482798ed558c5ddbb40dd8dcffb98aa4e81582"
+  },
+  "flop_model": "softmax_attention_forward",
+  "gpu": "NVIDIA B200",
+  "impl": "kernelagent-closed-1x",
+  "mean_ms": 2727.5084092881943,
+  "median_ms": 2727.551025390625,
+  "median_tflops": 412.78784387961315,
+  "mom_median_ms": 2727.551025390625,
+  "mom_median_tflops": 412.78784387961315,
+  "notes": [
+    "KernelAgent Closed wall-clock tuning budget 3682.7s (1x); elapsed 3682.8s.",
+    "Selected source sha256 3c73e42060837b2875cefa88d1482798ed558c5ddbb40dd8dcffb98aa4e81582; candidate 18; internal search time 2726.993896484375 ms.",
+    "GPT-5.6 had only a controlled CuTeDSL campaign MCP; no shell, web, arbitrary file, subagent, Helion, or FlashAttention access. Generated kernels ran in a network-isolated sandbox."
+  ],
+  "physical_gpu": "7",
+  "power_cap_w": 750,
+  "runs_ms": [
+    2727.37890625,
+    2727.63916015625,
+    2727.753662109375,
+    2727.624755859375,
+    2727.321533203125,
+    2727.4013671875,
+    2727.583740234375,
+    2727.321533203125,
+    2727.551025390625
+  ],
+  "shape": {
+    "biased": 0,
+    "causal": 0,
+    "dtype": "float16",
+    "h": 32,
+    "head_dim": 64,
+    "seq_len": 262144,
+    "z": 2
+  },
+  "std_ms": 0.15666306784906267,
+  "version": "KernelAgent v3-20260730; GPT-5.6; CuTe 4.5.1",
+  "version_label": "KernelAgent v3-20260730 / GPT-5.6 / CuTe 4.5.1"
+}

@@ -1,0 +1,11 @@
+"""Smoke-test shim; the production environment must install OmegaConf."""
+
+
+class OmegaConf:
+    @staticmethod
+    def load(path):
+        raise RuntimeError("OmegaConf YAML loading is unavailable in the smoke shim")
+
+    @staticmethod
+    def to_container(value, resolve=False):
+        return value

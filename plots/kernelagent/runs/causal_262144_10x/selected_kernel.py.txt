@@ -1,0 +1,804 @@
+from __future__ import annotations
+
+import torch
+import triton
+import triton.language as tl
+
+try:
+    from triton.tools.tensor_descriptor import TensorDescriptor  # Triton >= 3.4
+    _HAS_TMA = True
+except Exception:  # pragma: no cover
+    TensorDescriptor = None
+    _HAS_TMA = False
+
+
+def _alloc_fn(size: int, alignment: int, stream):
+    return torch.empty(size, dtype=torch.int8, device="cuda")
+
+
+_ALLOC_OK = False
+try:
+    triton.set_allocator(_alloc_fn)
+    _ALLOC_OK = True
+except Exception:  # pragma: no cover
+    _ALLOC_OK = False
+
+
+_NPART = 256
+_MARGIN = 12.0
+_HEXP_LO_ROWS = 32768
+_HACC_LO_ROWS = 65536
+
+
+# ---------------------------------------------------------------------------
+# Prepass: kmax[b,h] = max_j || k_j ||_2
+# Reads K exactly once (~0.3 ms of a ~790 ms run, < 0.05%).  Left in its
+# known-good form: five separate rounds of restructuring it (smaller tiles,
+# fewer stages, tl.dot / matmul-with-ones reductions) all landed inside the
+# +-0.4% noise band, which is exactly what Amdahl predicts for a kernel with
+# this share of the runtime.  The optimization effort belongs in the main loop.
+# ---------------------------------------------------------------------------
+@triton.jit
+def _knorm_part_kernel(K, PART, N_CTX, ROWS_PER_PART,
+                       stride_kz, stride_kh, stride_kn, stride_kk,
+                       H, NPART: tl.constexpr,
+                       HEAD_DIM: tl.constexpr, BLOCK_N: tl.constexpr):
+    pid = tl.program_id(0)
+    bh = tl.program_id(1)
+    off_z = bh // H
+    off_h = bh % H
+    base = K + off_z.to(tl.int64) * stride_kz + off_h.to(tl.int64) * stride_kh
+    offs_d = tl.arange(0, HEAD_DIM)
+    acc0 = tl.zeros([BLOCK_N], dtype=tl.float32)
+    acc1 = tl.zeros([BLOCK_N], dtype=tl.float32)
+    start = pid * ROWS_PER_PART
+    for i in tl.range(0, ROWS_PER_PART, 2 * BLOCK_N, num_stages=4):
+        o0 = start + i + tl.arange(0, BLOCK_N)
+        o1 = o0 + BLOCK_N
+        p0 = base + o0[:, None].to(tl.int64) * stride_kn + offs_d[None, :] * stride_kk
+        p1 = base + o1[:, None].to(tl.int64) * stride_kn + offs_d[None, :] * stride_kk
+        x0 = tl.load(p0, mask=(o0 < N_CTX)[:, None], other=0.0).to(tl.float32)
+        x1 = tl.load(p1, mask=(o1 < N_CTX)[:, None], other=0.0).to(tl.float32)
+        acc0 = tl.maximum(acc0, tl.sum(x0 * x0, 1))
+        acc1 = tl.maximum(acc1, tl.sum(x1 * x1, 1))
+    acc = tl.maximum(acc0, acc1)
+    tl.store(PART + bh.to(tl.int64) * NPART + pid, tl.max(acc, 0))
+
+
+@triton.jit
+def _knorm_final_kernel(PART, KMAX, NPART: tl.constexpr):
+    bh = tl.program_id(0)
+    offs = tl.arange(0, NPART)
+    v = tl.load(PART + bh.to(tl.int64) * NPART + offs)
+    tl.store(KMAX + bh, tl.sqrt(tl.max(v, 0)))
+
+
+# ---------------------------------------------------------------------------
+# Packed fp16 exp2: one MUFU instruction handles two elements (instruction
+# floor for the softmax: 1 XU op / 2 P elements).
+# ---------------------------------------------------------------------------
+@triton.jit
+def _ex2h(x):
+    return tl.inline_asm_elementwise(
+        "ex2.approx.f16x2 $0, $1;",
+        "=r,r",
+        [x],
+        dtype=tl.float16,
+        is_pure=True,
+        pack=2,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Variant A: TMA (+ optional warp specialization), fixed-shift softmax.
+# ---------------------------------------------------------------------------
+@triton.jit
+def _attn_fwd_tma(desc_q, desc_k, desc_v, desc_o, KMAX, sm_scale,
+                  N_CTX, START_M_BASE,
+                  HEAD_DIM: tl.constexpr, BLOCK_M: tl.constexpr,
+                  BLOCK_N: tl.constexpr, CAUSAL: tl.constexpr,
+                  WS: tl.constexpr, IS_BF16: tl.constexpr,
+                  HEXP: tl.constexpr, HACC: tl.constexpr,
+                  MARGIN: tl.constexpr):
+    start_m = START_M_BASE - tl.program_id(0)
+    off_hz = tl.program_id(1)
+
+    offset_y = off_hz * N_CTX
+    qo_y = offset_y + start_m * BLOCK_M
+
+    qk_scale = sm_scale * 1.44269504089916
+
+    q0 = desc_q.load([qo_y, 0])
+    qf = q0.to(tl.float32) * qk_scale
+    if IS_BF16:
+        q = qf.to(tl.bfloat16)
+    else:
+        q = qf.to(tl.float16)
+    q32 = q.to(tl.float32)
+    qn = tl.sqrt(tl.sum(q32 * q32, 1))
+    shift = qn * tl.load(KMAX + off_hz) - MARGIN
+    shift_h = shift.to(tl.float16)
+
+    l_i = tl.zeros([BLOCK_M], dtype=tl.float32)
+    acc = tl.zeros([BLOCK_M, HEAD_DIM], dtype=tl.float32)
+
+    offs_m = start_m * BLOCK_M + tl.arange(0, BLOCK_M)
+    offs_n = tl.arange(0, BLOCK_N)
+
+    if CAUSAL:
+        hi = start_m * BLOCK_M
+    else:
+        hi = N_CTX
+
+    kv_y = offset_y
+    for _ in tl.range(0, hi, BLOCK_N, warp_specialize=WS):
+        k = desc_k.load([kv_y, 0]).T
+        if HACC:
+            qk = tl.dot(q, k, out_dtype=tl.float16)
+        else:
+            qk = tl.dot(q, k)
+        v = desc_v.load([kv_y, 0])
+        if HACC:
+            ph = _ex2h(qk - shift_h[:, None])
+            l_i = l_i + tl.sum(ph, 1).to(tl.float32)
+            acc = tl.dot(ph, v, acc)
+        elif HEXP:
+            ph = _ex2h(qk.to(tl.float16) - shift_h[:, None])
+            l_i = l_i + tl.sum(ph, 1).to(tl.float32)
+            acc = tl.dot(ph, v, acc)
+        else:
+            p = tl.math.exp2(qk - shift[:, None])
+            l_i = l_i + tl.sum(p, 1)
+            if IS_BF16:
+                acc = tl.dot(p.to(tl.bfloat16), v, acc)
+            else:
+                acc = tl.dot(p.to(tl.float16), v, acc)
+        kv_y += BLOCK_N
+
+    if CAUSAL:
+        lo = start_m * BLOCK_M
+        kv_y2 = offset_y + lo
+        for start_n in tl.range(lo, lo + BLOCK_M, BLOCK_N,
+                                warp_specialize=(WS and (BLOCK_M > BLOCK_N))):
+            k = desc_k.load([kv_y2, 0]).T
+            if HACC:
+                qk = tl.dot(q, k, out_dtype=tl.float16)
+            else:
+                qk = tl.dot(q, k)
+            msk = offs_m[:, None] >= (start_n + offs_n[None, :])
+            v = desc_v.load([kv_y2, 0])
+            if HACC:
+                ph = _ex2h(qk - shift_h[:, None])
+                ph = tl.where(msk, ph, 0.0).to(tl.float16)
+                l_i = l_i + tl.sum(ph, 1).to(tl.float32)
+                acc = tl.dot(ph, v, acc)
+            elif HEXP:
+                ph = _ex2h(qk.to(tl.float16) - shift_h[:, None])
+                ph = tl.where(msk, ph, 0.0).to(tl.float16)
+                l_i = l_i + tl.sum(ph, 1).to(tl.float32)
+                acc = tl.dot(ph, v, acc)
+            else:
+                p = tl.where(msk, tl.math.exp2(qk - shift[:, None]), 0.0)
+                l_i = l_i + tl.sum(p, 1)
+                if IS_BF16:
+                    acc = tl.dot(p.to(tl.bfloat16), v, acc)
+                else:
+                    acc = tl.dot(p.to(tl.float16), v, acc)
+            kv_y2 += BLOCK_N
+
+    l_safe = tl.where(l_i > 0.0, l_i, 1.0)
+    acc = acc * (1.0 / l_safe)[:, None]
+    if IS_BF16:
+        desc_o.store([qo_y, 0], acc.to(tl.bfloat16))
+    else:
+        desc_o.store([qo_y, 0], acc.to(tl.float16))
+
+
+# ---------------------------------------------------------------------------
+# Variant A2: TMA + 2-way interleaved KV tiles (requires BLOCK_M == 2*BLOCK_N).
+#
+# Rationale (the actual bottleneck): a 128x128 P tile needs ~512 cycles of
+# MUFU (ex2.approx.f16x2, 8192 packed ops at 16/cycle/SM) and ~500 cycles of
+# tensor-pipe time.  The two are co-limiters, so the ceiling is set by how well
+# they overlap.  In the single-tile loop the chain qk -> ex2 -> PV is a strict
+# dependency, so the XU pipe idles during MMA and vice versa.  Issuing two
+# independent tiles per trip lets tile 1's QK/PV MMAs run while tile 0's
+# exponentials occupy the XU pipe, without shrinking the tile (arithmetic
+# intensity and K/V reuse are unchanged).  Row sums are fused (sum(p0+p1))
+# so the cross-lane reduction tree is walked once per pair instead of twice;
+# the fp16 range of the fused sum is identical to the BLOCK_N=128 single-tile
+# case, so numerics are unchanged.
+# ---------------------------------------------------------------------------
+@triton.jit
+def _attn_fwd_tma_i(desc_q, desc_k, desc_v, desc_o, KMAX, sm_scale,
+                    N_CTX, START_M_BASE,
+                    HEAD_DIM: tl.constexpr, BLOCK_M: tl.constexpr,
+                    BLOCK_N: tl.constexpr, CAUSAL: tl.constexpr,
+                    WS: tl.constexpr, IS_BF16: tl.constexpr,
+                    HEXP: tl.constexpr, HACC: tl.constexpr,
+                    MARGIN: tl.constexpr):
+    start_m = START_M_BASE - tl.program_id(0)
+    off_hz = tl.program_id(1)
+
+    offset_y = off_hz * N_CTX
+    qo_y = offset_y + start_m * BLOCK_M
+
+    qk_scale = sm_scale * 1.44269504089916
+
+    q0 = desc_q.load([qo_y, 0])
+    qf = q0.to(tl.float32) * qk_scale
+    if IS_BF16:
+        q = qf.to(tl.bfloat16)
+    else:
+        q = qf.to(tl.float16)
+    q32 = q.to(tl.float32)
+    qn = tl.sqrt(tl.sum(q32 * q32, 1))
+    shift = qn * tl.load(KMAX + off_hz) - MARGIN
+    shift_h = shift.to(tl.float16)
+
+    l_i = tl.zeros([BLOCK_M], dtype=tl.float32)
+    acc = tl.zeros([BLOCK_M, HEAD_DIM], dtype=tl.float32)
+
+    offs_m = start_m * BLOCK_M + tl.arange(0, BLOCK_M)
+    offs_n = tl.arange(0, BLOCK_N)
+
+    if CAUSAL:
+        hi = start_m * BLOCK_M
+    else:
+        hi = N_CTX
+
+    kv_y = offset_y
+    for _ in tl.range(0, hi, 2 * BLOCK_N, warp_specialize=WS):
+        k0 = desc_k.load([kv_y, 0]).T
+        k1 = desc_k.load([kv_y + BLOCK_N, 0]).T
+        if HACC:
+            qk0 = tl.dot(q, k0, out_dtype=tl.float16)
+            qk1 = tl.dot(q, k1, out_dtype=tl.float16)
+            p0 = _ex2h(qk0 - shift_h[:, None])
+            p1 = _ex2h(qk1 - shift_h[:, None])
+            v0 = desc_v.load([kv_y, 0])
+            v1 = desc_v.load([kv_y + BLOCK_N, 0])
+            l_i = l_i + tl.sum(p0 + p1, 1).to(tl.float32)
+            acc = tl.dot(p0, v0, acc)
+            acc = tl.dot(p1, v1, acc)
+        elif HEXP:
+            qk0 = tl.dot(q, k0)
+            qk1 = tl.dot(q, k1)
+            p0 = _ex2h(qk0.to(tl.float16) - shift_h[:, None])
+            p1 = _ex2h(qk1.to(tl.float16) - shift_h[:, None])
+            v0 = desc_v.load([kv_y, 0])
+            v1 = desc_v.load([kv_y + BLOCK_N, 0])
+            l_i = l_i + tl.sum(p0 + p1, 1).to(tl.float32)
+            acc = tl.dot(p0, v0, acc)
+            acc = tl.dot(p1, v1, acc)
+        else:
+            qk0 = tl.dot(q, k0)
+            qk1 = tl.dot(q, k1)
+            f0 = tl.math.exp2(qk0 - shift[:, None])
+            f1 = tl.math.exp2(qk1 - shift[:, None])
+            v0 = desc_v.load([kv_y, 0])
+            v1 = desc_v.load([kv_y + BLOCK_N, 0])
+            l_i = l_i + tl.sum(f0, 1) + tl.sum(f1, 1)
+            if IS_BF16:
+                acc = tl.dot(f0.to(tl.bfloat16), v0, acc)
+                acc = tl.dot(f1.to(tl.bfloat16), v1, acc)
+            else:
+                acc = tl.dot(f0.to(tl.float16), v0, acc)
+                acc = tl.dot(f1.to(tl.float16), v1, acc)
+        kv_y += 2 * BLOCK_N
+
+    if CAUSAL:
+        lo = start_m * BLOCK_M
+        kv_y2 = offset_y + lo
+        k0 = desc_k.load([kv_y2, 0]).T
+        k1 = desc_k.load([kv_y2 + BLOCK_N, 0]).T
+        msk0 = offs_m[:, None] >= (lo + offs_n[None, :])
+        msk1 = offs_m[:, None] >= (lo + BLOCK_N + offs_n[None, :])
+        v0 = desc_v.load([kv_y2, 0])
+        v1 = desc_v.load([kv_y2 + BLOCK_N, 0])
+        if HACC:
+            qk0 = tl.dot(q, k0, out_dtype=tl.float16)
+            qk1 = tl.dot(q, k1, out_dtype=tl.float16)
+            p0 = tl.where(msk0, _ex2h(qk0 - shift_h[:, None]), 0.0).to(tl.float16)
+            p1 = tl.where(msk1, _ex2h(qk1 - shift_h[:, None]), 0.0).to(tl.float16)
+            l_i = l_i + tl.sum(p0 + p1, 1).to(tl.float32)
+            acc = tl.dot(p0, v0, acc)
+            acc = tl.dot(p1, v1, acc)
+        elif HEXP:
+            qk0 = tl.dot(q, k0)
+            qk1 = tl.dot(q, k1)
+            p0 = tl.where(msk0, _ex2h(qk0.to(tl.float16) - shift_h[:, None]),
+                          0.0).to(tl.float16)
+            p1 = tl.where(msk1, _ex2h(qk1.to(tl.float16) - shift_h[:, None]),
+                          0.0).to(tl.float16)
+            l_i = l_i + tl.sum(p0 + p1, 1).to(tl.float32)
+            acc = tl.dot(p0, v0, acc)
+            acc = tl.dot(p1, v1, acc)
+        else:
+            qk0 = tl.dot(q, k0)
+            qk1 = tl.dot(q, k1)
+            f0 = tl.where(msk0, tl.math.exp2(qk0 - shift[:, None]), 0.0)
+            f1 = tl.where(msk1, tl.math.exp2(qk1 - shift[:, None]), 0.0)
+            l_i = l_i + tl.sum(f0, 1) + tl.sum(f1, 1)
+            if IS_BF16:
+                acc = tl.dot(f0.to(tl.bfloat16), v0, acc)
+                acc = tl.dot(f1.to(tl.bfloat16), v1, acc)
+            else:
+                acc = tl.dot(f0.to(tl.float16), v0, acc)
+                acc = tl.dot(f1.to(tl.float16), v1, acc)
+
+    l_safe = tl.where(l_i > 0.0, l_i, 1.0)
+    acc = acc * (1.0 / l_safe)[:, None]
+    if IS_BF16:
+        desc_o.store([qo_y, 0], acc.to(tl.bfloat16))
+    else:
+        desc_o.store([qo_y, 0], acc.to(tl.float16))
+
+
+# ---------------------------------------------------------------------------
+# Variant B: portable block-pointer kernel.
+# ---------------------------------------------------------------------------
+@triton.jit
+def _attn_fwd_bp(Q, K, V, Out, KMAX, sm_scale,
+                 stride_qz, stride_qh, stride_qm, stride_qk,
+                 stride_kz, stride_kh, stride_kn, stride_kk,
+                 stride_vz, stride_vh, stride_vn, stride_vk,
+                 stride_oz, stride_oh, stride_om, stride_ok,
+                 H, N_CTX, START_M_BASE,
+                 HEAD_DIM: tl.constexpr, BLOCK_M: tl.constexpr,
+                 BLOCK_N: tl.constexpr, CAUSAL: tl.constexpr,
+                 EVEN: tl.constexpr, IS_BF16: tl.constexpr,
+                 HEXP: tl.constexpr, HACC: tl.constexpr,
+                 MARGIN: tl.constexpr):
+    start_m = START_M_BASE - tl.program_id(0)
+    off_hz = tl.program_id(1)
+    off_z = off_hz // H
+    off_h = off_hz % H
+
+    q_base = Q + off_z.to(tl.int64) * stride_qz + off_h.to(tl.int64) * stride_qh
+    k_base = K + off_z.to(tl.int64) * stride_kz + off_h.to(tl.int64) * stride_kh
+    v_base = V + off_z.to(tl.int64) * stride_vz + off_h.to(tl.int64) * stride_vh
+    o_base = Out + off_z.to(tl.int64) * stride_oz + off_h.to(tl.int64) * stride_oh
+
+    Q_bp = tl.make_block_ptr(base=q_base, shape=(N_CTX, HEAD_DIM),
+                             strides=(stride_qm, stride_qk),
+                             offsets=(start_m * BLOCK_M, 0),
+                             block_shape=(BLOCK_M, HEAD_DIM), order=(1, 0))
+    Kp = tl.make_block_ptr(base=k_base, shape=(HEAD_DIM, N_CTX),
+                           strides=(stride_kk, stride_kn),
+                           offsets=(0, 0),
+                           block_shape=(HEAD_DIM, BLOCK_N), order=(0, 1))
+    Vp = tl.make_block_ptr(base=v_base, shape=(N_CTX, HEAD_DIM),
+                           strides=(stride_vn, stride_vk),
+                           offsets=(0, 0),
+                           block_shape=(BLOCK_N, HEAD_DIM), order=(1, 0))
+    O_bp = tl.make_block_ptr(base=o_base, shape=(N_CTX, HEAD_DIM),
+                             strides=(stride_om, stride_ok),
+                             offsets=(start_m * BLOCK_M, 0),
+                             block_shape=(BLOCK_M, HEAD_DIM), order=(1, 0))
+
+    qk_scale = sm_scale * 1.44269504089916
+    if EVEN:
+        q0 = tl.load(Q_bp)
+    else:
+        q0 = tl.load(Q_bp, boundary_check=(0,), padding_option="zero")
+    qf = q0.to(tl.float32) * qk_scale
+    if IS_BF16:
+        q = qf.to(tl.bfloat16)
+    else:
+        q = qf.to(tl.float16)
+    q32 = q.to(tl.float32)
+    qn = tl.sqrt(tl.sum(q32 * q32, 1))
+    shift = qn * tl.load(KMAX + off_hz) - MARGIN
+    shift_h = shift.to(tl.float16)
+
+    l_i = tl.zeros([BLOCK_M], dtype=tl.float32)
+    acc = tl.zeros([BLOCK_M, HEAD_DIM], dtype=tl.float32)
+    offs_m = start_m * BLOCK_M + tl.arange(0, BLOCK_M)
+    offs_n = tl.arange(0, BLOCK_N)
+
+    if CAUSAL:
+        hi = start_m * BLOCK_M
+    else:
+        hi = N_CTX
+
+    for start_n in tl.range(0, hi, BLOCK_N):
+        if EVEN:
+            kk = tl.load(Kp)
+            vv = tl.load(Vp)
+        else:
+            kk = tl.load(Kp, boundary_check=(1,), padding_option="zero")
+            vv = tl.load(Vp, boundary_check=(0,), padding_option="zero")
+        if HACC:
+            qk = tl.dot(q, kk, out_dtype=tl.float16)
+            ph = _ex2h(qk - shift_h[:, None])
+            if not EVEN:
+                ph = tl.where((start_n + offs_n)[None, :] < N_CTX, ph, 0.0).to(tl.float16)
+            l_i = l_i + tl.sum(ph, 1).to(tl.float32)
+            acc = tl.dot(ph, vv, acc)
+        elif HEXP:
+            qk = tl.dot(q, kk)
+            ph = _ex2h(qk.to(tl.float16) - shift_h[:, None])
+            if not EVEN:
+                ph = tl.where((start_n + offs_n)[None, :] < N_CTX, ph, 0.0).to(tl.float16)
+            l_i = l_i + tl.sum(ph, 1).to(tl.float32)
+            acc = tl.dot(ph, vv, acc)
+        else:
+            qk = tl.dot(q, kk)
+            p = tl.math.exp2(qk - shift[:, None])
+            if not EVEN:
+                p = tl.where((start_n + offs_n)[None, :] < N_CTX, p, 0.0)
+            l_i = l_i + tl.sum(p, 1)
+            if IS_BF16:
+                acc = tl.dot(p.to(tl.bfloat16), vv, acc)
+            else:
+                acc = tl.dot(p.to(tl.float16), vv, acc)
+        Kp = tl.advance(Kp, (0, BLOCK_N))
+        Vp = tl.advance(Vp, (BLOCK_N, 0))
+
+    if CAUSAL:
+        lo = start_m * BLOCK_M
+        for start_n in tl.range(lo, lo + BLOCK_M, BLOCK_N):
+            if EVEN:
+                kk = tl.load(Kp)
+                vv = tl.load(Vp)
+            else:
+                kk = tl.load(Kp, boundary_check=(1,), padding_option="zero")
+                vv = tl.load(Vp, boundary_check=(0,), padding_option="zero")
+            msk = offs_m[:, None] >= (start_n + offs_n[None, :])
+            if HACC:
+                qk = tl.dot(q, kk, out_dtype=tl.float16)
+                ph = _ex2h(qk - shift_h[:, None])
+                ph = tl.where(msk, ph, 0.0).to(tl.float16)
+                l_i = l_i + tl.sum(ph, 1).to(tl.float32)
+                acc = tl.dot(ph, vv, acc)
+            elif HEXP:
+                qk = tl.dot(q, kk)
+                ph = _ex2h(qk.to(tl.float16) - shift_h[:, None])
+                ph = tl.where(msk, ph, 0.0).to(tl.float16)
+                l_i = l_i + tl.sum(ph, 1).to(tl.float32)
+                acc = tl.dot(ph, vv, acc)
+            else:
+                qk = tl.dot(q, kk)
+                p = tl.where(msk, tl.math.exp2(qk - shift[:, None]), 0.0)
+                l_i = l_i + tl.sum(p, 1)
+                if IS_BF16:
+                    acc = tl.dot(p.to(tl.bfloat16), vv, acc)
+                else:
+                    acc = tl.dot(p.to(tl.float16), vv, acc)
+            Kp = tl.advance(Kp, (0, BLOCK_N))
+            Vp = tl.advance(Vp, (BLOCK_N, 0))
+
+    l_safe = tl.where(l_i > 0.0, l_i, 1.0)
+    acc = acc * (1.0 / l_safe)[:, None]
+    if EVEN:
+        tl.store(O_bp, acc.to(Out.dtype.element_ty))
+    else:
+        tl.store(O_bp, acc.to(Out.dtype.element_ty), boundary_check=(0,))
+
+
+# ---------------------------------------------------------------------------
+# Host helpers
+# ---------------------------------------------------------------------------
+_CFG_CACHE: dict = {}
+
+_DEFAULT = {
+    16: ("bp", 128, 128, 8, 3, None, 0, 0),
+    32: ("bp", 128, 128, 8, 3, None, 0, 0),
+    64: ("bp", 128, 128, 8, 3, None, 0, 0),
+    128: ("bp", 128, 64, 8, 3, None, 0, 0),
+    256: ("bp", 64, 64, 8, 2, None, 0, 0),
+}
+
+
+def _cap():
+    try:
+        return torch.cuda.get_device_capability()
+    except Exception:
+        return (0, 0)
+
+
+def _tma_ok(q, k, v, out):
+    if not (_HAS_TMA and _ALLOC_OK):
+        return False
+    if q.dtype not in (torch.float16, torch.bfloat16):
+        return False
+    for t in (q, k, v, out):
+        if not t.is_contiguous():
+            return False
+    if q.shape[-1] < 64:
+        return False
+    if (q.shape[-1] * q.element_size()) % 16 != 0:
+        return False
+    return _cap()[0] >= 9
+
+
+def _compute_kmax(k):
+    B, H, N, D = k.shape
+    bh = B * H
+    npart = _NPART
+    part = torch.empty((bh, npart), dtype=torch.float32, device=k.device)
+    kmax = torch.empty((bh,), dtype=torch.float32, device=k.device)
+    BLOCK_N = 128 if N >= 256 else 16
+    step = 2 * BLOCK_N
+    rows_per_part = triton.cdiv(triton.cdiv(N, npart), step) * step
+    _knorm_part_kernel[(npart, bh)](
+        k, part, N, rows_per_part,
+        k.stride(0), k.stride(1), k.stride(2), k.stride(3),
+        H, NPART=npart, HEAD_DIM=D, BLOCK_N=BLOCK_N,
+        num_warps=8, num_stages=1)
+    _knorm_final_kernel[(bh,)](part, kmax, NPART=npart, num_warps=2)
+    return kmax
+
+
+def _make_descs(q, k, v, out, BM, BN, HEAD_DIM):
+    B, H, N, D = q.shape
+    y = B * H * N
+    dq = TensorDescriptor.from_tensor(q.view(y, D), [BM, HEAD_DIM])
+    dk = TensorDescriptor.from_tensor(k.view(y, D), [BN, HEAD_DIM])
+    dv = TensorDescriptor.from_tensor(v.view(y, D), [BN, HEAD_DIM])
+    do = TensorDescriptor.from_tensor(out.view(y, D), [BM, HEAD_DIM])
+    return dq, dk, dv, do
+
+
+def _launch(cand, q, k, v, out, kmax, sm_scale, causal, grid_x, base_m, n_hz):
+    variant, BM, BN, nw, ns, mnr, hexp, hacc = cand
+    if grid_x <= 0 or n_hz <= 0:
+        return
+    B, H, N_CTX, HEAD_DIM = q.shape
+    extra = {}
+    if mnr is not None:
+        extra["maxnreg"] = mnr
+    grid = (grid_x, n_hz, 1)
+    is_bf16 = (q.dtype == torch.bfloat16)
+    fp16 = (q.dtype == torch.float16)
+    use_h = bool(hexp) and fp16
+    use_a = bool(hacc) and fp16
+
+    if variant == "bp":
+        EVEN = (N_CTX % BM == 0) and (N_CTX % BN == 0)
+        _attn_fwd_bp[grid](
+            q, k, v, out, kmax, sm_scale,
+            q.stride(0), q.stride(1), q.stride(2), q.stride(3),
+            k.stride(0), k.stride(1), k.stride(2), k.stride(3),
+            v.stride(0), v.stride(1), v.stride(2), v.stride(3),
+            out.stride(0), out.stride(1), out.stride(2), out.stride(3),
+            H, N_CTX, base_m,
+            HEAD_DIM=HEAD_DIM, BLOCK_M=BM, BLOCK_N=BN, CAUSAL=causal,
+            EVEN=EVEN, IS_BF16=is_bf16, HEXP=use_h, HACC=use_a,
+            MARGIN=_MARGIN, num_warps=nw, num_stages=ns, **extra)
+        return
+
+    ws = variant.endswith("_ws")
+    # The interleaved kernel keeps two P tiles live; only take that path for the
+    # fp16-P segments.  The fp32-P (low-row, high-precision) segments stay on
+    # the single-tile kernel so register pressure / numerics are unchanged.
+    interleaved = variant.startswith("tma_i") and (use_h or use_a)
+
+    dq, dk, dv, do = _make_descs(q, k, v, out, BM, BN, HEAD_DIM)
+    if interleaved:
+        _attn_fwd_tma_i[grid](
+            dq, dk, dv, do, kmax, sm_scale, N_CTX, base_m,
+            HEAD_DIM=HEAD_DIM, BLOCK_M=BM, BLOCK_N=BN, CAUSAL=causal,
+            WS=ws, IS_BF16=is_bf16, HEXP=use_h, HACC=use_a,
+            MARGIN=_MARGIN, num_warps=nw, num_stages=ns, **extra)
+    else:
+        _attn_fwd_tma[grid](
+            dq, dk, dv, do, kmax, sm_scale, N_CTX, base_m,
+            HEAD_DIM=HEAD_DIM, BLOCK_M=BM, BLOCK_N=BN, CAUSAL=causal,
+            WS=ws, IS_BF16=is_bf16, HEXP=use_h,
+            HACC=use_a, MARGIN=_MARGIN, num_warps=nw, num_stages=ns, **extra)
+
+
+def _full_launch(cand, q, k, v, out, kmax, sm_scale, causal):
+    B, H, N_CTX, _ = q.shape
+    variant, BM, BN, nw, ns, mnr, hexp, hacc = cand
+    gx = triton.cdiv(N_CTX, BM)
+    n_hz = B * H
+    fp16 = (q.dtype == torch.float16)
+
+    if causal and fp16 and (hexp or hacc):
+        m1 = min(gx, triton.cdiv(_HEXP_LO_ROWS, BM))
+        m2 = min(gx, max(m1, triton.cdiv(_HACC_LO_ROWS, BM)))
+        segs = []
+        if hacc and gx > m2:
+            segs.append((m2, gx, hexp, hacc))
+            top = m2
+        else:
+            top = gx
+        if top > m1:
+            segs.append((m1, top, hexp, 0))
+        if m1 > 0:
+            segs.append((0, m1, 0, 0))
+        for (lo, hi, he, ha) in segs:
+            if hi <= lo:
+                continue
+            c = (variant, BM, BN, nw, ns, mnr, he, ha)
+            _launch(c, q, k, v, out, kmax, sm_scale, causal,
+                    hi - lo, hi - 1, n_hz)
+        return
+
+    _launch(cand, q, k, v, out, kmax, sm_scale, causal, gx, gx - 1, n_hz)
+
+
+def _candidates(D, tma, fp16, major):
+    h = 1 if fp16 else 0
+    a = 1 if fp16 else 0
+    c = []
+    if D <= 64:
+        if tma and major >= 10:
+            c += [
+                # Known-good reference point first (acts as the noise anchor).
+                ("tma_ws", 128, 128, 4, 3, 80, h, a),
+                # 2-way interleaved KV tiles: overlaps the XU (ex2) pipe of one
+                # tile with the tensor pipe of the other.  Same 128-row M tile,
+                # so arithmetic intensity / K-V reuse are preserved.
+                ("tma_i_ws", 128, 64, 4, 3, None, h, a),
+                ("tma_i_ws", 128, 64, 4, 4, None, h, a),
+                ("tma_i_ws", 128, 64, 8, 3, None, h, a),
+                ("tma_i_ws", 128, 64, 4, 3, 128, h, a),
+                ("tma_i", 128, 64, 4, 3, None, h, a),
+                ("tma_i_ws", 256, 128, 8, 2, None, h, a),
+                # Single-tile reference variations (more reuse per CTA).
+                ("tma_ws", 128, 128, 8, 3, None, h, a),
+                ("tma_ws", 256, 128, 8, 3, None, h, a),
+                ("tma_ws", 128, 128, 4, 4, 80, h, a),
+            ]
+        elif tma:
+            c += [("tma_ws", 128, 128, 8, 3, None, h, a),
+                  ("tma_i_ws", 128, 64, 8, 3, None, h, a),
+                  ("tma", 128, 128, 8, 3, None, h, a),
+                  ("tma", 256, 128, 8, 3, None, h, a)]
+        c += [("bp", 128, 128, 8, 3, None, h, 0)]
+        return c
+    if D == 128:
+        if tma and major >= 10:
+            c += [("tma_ws", 128, 128, 4, 3, 168, h, a),
+                  ("tma_i_ws", 128, 64, 4, 3, None, h, a),
+                  ("tma_i_ws", 128, 64, 8, 3, None, h, a),
+                  ("tma_ws", 128, 128, 8, 3, None, h, a),
+                  ("tma_ws", 256, 128, 8, 2, None, h, a),
+                  ("tma_ws", 128, 64, 4, 4, None, h, a)]
+        elif tma:
+            c += [("tma", 128, 64, 8, 3, None, h, a),
+                  ("tma", 128, 128, 8, 2, None, h, a),
+                  ("tma_i", 128, 64, 8, 3, None, h, a)]
+        c += [("bp", 128, 64, 8, 3, None, h, 0)]
+        return c
+    if D >= 256:
+        return [("bp", 64, 64, 8, 2, None, h, 0),
+                ("bp", 128, 64, 8, 2, None, h, 0),
+                ("bp", 64, 32, 8, 2, None, 0, 0)]
+    return [("bp", 128, 128, 8, 3, None, h, 0)]
+
+
+def _time(fn, warmup=1, reps=2):
+    for _ in range(warmup):
+        fn()
+    torch.cuda.synchronize()
+    best = float("inf")
+    s = torch.cuda.Event(enable_timing=True)
+    e = torch.cuda.Event(enable_timing=True)
+    for _ in range(reps):
+        s.record()
+        fn()
+        e.record()
+        torch.cuda.synchronize()
+        best = min(best, s.elapsed_time(e))
+    return best
+
+
+def _pick_config(q, k, v, out, kmax, sm_scale, causal):
+    B, H, N_CTX, HEAD_DIM = q.shape
+    key = (str(q.dtype), B, H, N_CTX, HEAD_DIM, bool(causal),
+           q.is_contiguous(), torch.cuda.current_device())
+    if key in _CFG_CACHE:
+        return _CFG_CACHE[key]
+
+    fp16 = (q.dtype == torch.float16)
+    cands = _candidates(HEAD_DIM, _tma_ok(q, k, v, out), fp16, _cap()[0])
+
+    # Probe design.  Two properties matter and the previous probe had neither:
+    #  * work-equal: every candidate covers the same ROWS_TEST rows of Q, so
+    #    BLOCK_M does not bias the measurement;
+    #  * occupancy-representative: ~512 concurrent CTAs (>= 3 per SM on a
+    #    148-SM part) so pipelining/warp-specialization configs are ranked
+    #    under the residency they will actually see in the full launch.  The
+    #    old probe used 256 CTAs (1.7/SM) at the very top of the causal
+    #    triangle, which both under-occupied the GPU and cost ~2% of the total
+    #    runtime per candidate.
+    ROWS_TEST = 4096
+    TRIP_ROWS = 32768
+    n_hz_test = min(B * H, 16)
+
+    valid = []
+    for cand in cands:
+        variant, BM, BN = cand[0], cand[1], cand[2]
+        if BM > N_CTX:
+            continue
+        if variant != "bp" and ((N_CTX % BM) or (N_CTX % BN)):
+            continue
+        if variant.startswith("tma_i") and BM != 2 * BN:
+            continue
+        valid.append(cand)
+
+    best, best_t = None, float("inf")
+    ref_t = None
+    for idx, cand in enumerate(valid):
+        BM = cand[1]
+        n_m = triton.cdiv(N_CTX, BM)
+        gxt = max(1, min(n_m, ROWS_TEST // BM))
+        m_lo = min(max(0, n_m - gxt), TRIP_ROWS // BM)
+        base = min(n_m - 1, m_lo + gxt - 1)
+        try:
+            t = _time(lambda c=cand, g=gxt, b=base:
+                      _launch(c, q, k, v, out, kmax, sm_scale, causal,
+                              g, b, n_hz_test))
+        except Exception:
+            continue
+        if idx == 0:
+            ref_t = t
+        if t < best_t:
+            best_t, best = t, cand
+
+    # Only depart from the known-good reference point on a win outside noise.
+    if best is not None and ref_t is not None and valid:
+        if best is not valid[0] and best_t > ref_t * 0.99:
+            best = valid[0]
+
+    if best is None:
+        best = _DEFAULT.get(HEAD_DIM, ("bp", 128, 128, 8, 3, None, 0, 0))
+    _CFG_CACHE[key] = best
+    return best
+
+
+# ---------------------------------------------------------------------------
+# Public API
+# ---------------------------------------------------------------------------
+def kernel_function(q: torch.Tensor,
+                    k: torch.Tensor,
+                    v: torch.Tensor,
+                    is_causal: bool = True,
+                    sm_scale: float | None = None) -> torch.Tensor:
+    if not (q.is_cuda and k.is_cuda and v.is_cuda):
+        raise ValueError("q, k, v must be CUDA tensors")
+    if q.dim() != 4 or k.dim() != 4 or v.dim() != 4:
+        raise ValueError("q, k, v must be 4-D [B, H, N, D] tensors")
+    if not (q.shape == k.shape == v.shape):
+        raise ValueError("q, k, v must have identical shapes")
+    if not (q.dtype == k.dtype == v.dtype):
+        raise ValueError("q, k, v must share a dtype")
+
+    B, H, N_CTX, HEAD_DIM = q.shape
+    if HEAD_DIM not in (16, 32, 64, 128, 256):
+        raise ValueError(f"unsupported head dim {HEAD_DIM}")
+
+    if sm_scale is None:
+        sm_scale = float(HEAD_DIM) ** -0.5
+
+    out = torch.empty_like(q)
+    causal = bool(is_causal)
+
+    kmax = _compute_kmax(k)
+
+    try:
+        cfg = _pick_config(q, k, v, out, kmax, sm_scale, causal)
+    except Exception:
+        cfg = _DEFAULT.get(HEAD_DIM, ("bp", 128, 128, 8, 3, None, 0, 0))
+
+    try:
+        _full_launch(cfg, q, k, v, out, kmax, sm_scale, causal)
+    except Exception:
+        try:
+            safe = (cfg[0], cfg[1], cfg[2], cfg[3], cfg[4], cfg[5], cfg[6], 0)
+            _full_launch(safe, q, k, v, out, kmax, sm_scale, causal)
+        except Exception:
+            try:
+                _full_launch(_DEFAULT.get(HEAD_DIM,
+                                          ("bp", 128, 128, 8, 3, None, 0, 0)),
+                             q, k, v, out, kmax, sm_scale, causal)
+            except Exception:
+                _full_launch(("bp", 64, 64, 4, 2, None, 0, 0),
+                             q, k, v, out, kmax, sm_scale, causal)
+
+    return out

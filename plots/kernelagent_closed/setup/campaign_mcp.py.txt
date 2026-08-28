@@ -1,0 +1,837 @@
+from __future__ import annotations
+
+import argparse
+import ast
+import contextlib
+import hashlib
+import json
+import os
+from pathlib import Path
+import re
+import signal
+import subprocess
+import sys
+import time
+from typing import Any
+
+MAX_SOURCE_BYTES = 300_000
+MAX_REFERENCE_LINES = 400
+MAX_SEARCH_RESULTS = 100
+ALLOWED_IMPORT_ROOTS = {
+    "__future__",
+    "collections",
+    "cuda",
+    "cutlass",
+    "dataclasses",
+    "enum",
+    "functools",
+    "math",
+    "operator",
+    "torch",
+    "typing",
+}
+BANNED_SOURCE_FRAGMENTS = (
+    "scaled_dot_product_attention",
+    "flex_attention",
+    "torch.compile",
+    "torch._inductor",
+    "torch.utils.cpp_extension",
+    "torch.ops.aten._scaled_dot_product",
+    "triton",
+    "helion",
+    "flash_attn",
+    "subprocess",
+    "socket",
+    "requests",
+    "urllib",
+    "http.client",
+    "ctypes",
+    "importlib",
+    "os.system",
+    "os.popen",
+    "eval(",
+    "exec(",
+    "open(",
+)
+_ACTIVE_PROCESS_GROUPS: set[int] = set()
+_RESTORE_SIGNAL_MASK_CODE = (
+    "import os,signal,sys;"
+    "signal.pthread_sigmask(signal.SIG_SETMASK,"
+    "{int(value) for value in sys.argv[1].split(',') if value});"
+    "os.execvpe(sys.argv[2],sys.argv[2:],os.environ)"
+)
+
+
+def _command_restoring_signal_mask(
+    command: list[str], previous_mask: set[signal.Signals]
+) -> list[str]:
+    serialized_mask = ",".join(str(int(value)) for value in sorted(previous_mask))
+    return [sys.executable, "-c", _RESTORE_SIGNAL_MASK_CODE, serialized_mask, *command]
+
+
+def _terminate_process_group(process: subprocess.Popen[str]) -> None:
+    if process.poll() is not None:
+        return
+    with contextlib.suppress(ProcessLookupError):
+        os.killpg(process.pid, signal.SIGTERM)
+    try:
+        process.wait(timeout=1)
+    except subprocess.TimeoutExpired:
+        with contextlib.suppress(ProcessLookupError):
+            os.killpg(process.pid, signal.SIGKILL)
+        with contextlib.suppress(subprocess.TimeoutExpired):
+            process.wait(timeout=1)
+
+
+def _terminate_active_process_groups() -> None:
+    for process_group in tuple(_ACTIVE_PROCESS_GROUPS):
+        with contextlib.suppress(ProcessLookupError):
+            os.killpg(process_group, signal.SIGTERM)
+    deadline = time.monotonic() + 1.5
+    while _ACTIVE_PROCESS_GROUPS and time.monotonic() < deadline:
+        for process_group in tuple(_ACTIVE_PROCESS_GROUPS):
+            try:
+                os.killpg(process_group, 0)
+            except ProcessLookupError:
+                _ACTIVE_PROCESS_GROUPS.discard(process_group)
+        if _ACTIVE_PROCESS_GROUPS:
+            time.sleep(0.05)
+    for process_group in tuple(_ACTIVE_PROCESS_GROUPS):
+        with contextlib.suppress(ProcessLookupError):
+            os.killpg(process_group, signal.SIGKILL)
+
+
+def _handle_signal(signum: int, _frame: object) -> None:
+    signal.signal(signum, signal.SIG_DFL)
+    _terminate_active_process_groups()
+    raise SystemExit(128 + signum)
+
+
+def _tool(
+    name: str, description: str, properties: dict[str, Any], required: list[str]
+) -> dict[str, Any]:
+    return {
+        "name": name,
+        "description": description,
+        "inputSchema": {
+            "type": "object",
+            "properties": properties,
+            "required": required,
+            "additionalProperties": False,
+        },
+    }
+
+
+TOOLS = [
+    _tool(
+        "campaign_status",
+        "Return the fixed workload, time remaining, iteration history, and best result.",
+        {},
+        [],
+    ),
+    _tool(
+        "list_references",
+        "List the bundled read-only reference files available to this campaign.",
+        {},
+        [],
+    ),
+    _tool(
+        "read_reference",
+        "Read a line range from one bundled reference file.",
+        {
+            "path": {"type": "string"},
+            "start_line": {"type": "integer", "minimum": 1},
+            "max_lines": {
+                "type": "integer",
+                "minimum": 1,
+                "maximum": MAX_REFERENCE_LINES,
+            },
+        },
+        ["path"],
+    ),
+    _tool(
+        "search_references",
+        "Search bundled references for a literal or regular-expression query.",
+        {
+            "query": {"type": "string"},
+            "path": {"type": "string"},
+            "max_results": {
+                "type": "integer",
+                "minimum": 1,
+                "maximum": MAX_SEARCH_RESULTS,
+            },
+        },
+        ["query"],
+    ),
+    _tool(
+        "test_candidate",
+        (
+            "Compile a complete self-contained CuTeDSL candidate and run both "
+            "full-output correctness cases without benchmarking it. Use this "
+            "until a source passes, then submit the identical source."
+        ),
+        {
+            "source": {"type": "string"},
+            "hypothesis": {"type": "string"},
+        },
+        ["source", "hypothesis"],
+    ),
+    _tool(
+        "submit_candidate",
+        (
+            "Authoritatively compile, rerun both correctness cases, and benchmark "
+            "a complete self-contained CuTeDSL candidate. Source must define "
+            "kernel_function(q, k, v)."
+        ),
+        {
+            "source": {"type": "string"},
+            "hypothesis": {"type": "string"},
+            "mutation_family": {"type": "string"},
+        },
+        ["source", "hypothesis", "mutation_family"],
+    ),
+    _tool(
+        "get_best_source",
+        "Return the complete source and metrics of the best verified candidate.",
+        {},
+        [],
+    ),
+    _tool(
+        "profile_best",
+        "Run one Nsight Compute basic profile of the current best candidate.",
+        {},
+        [],
+    ),
+]
+
+
+class Campaign:
+    def __init__(self, args: argparse.Namespace) -> None:
+        self.run_dir = args.run_dir.resolve()
+        self.reference_root = args.reference_root.resolve()
+        self.setup_root = Path(__file__).resolve().parent
+        self.seq_len = args.seq_len
+        self.causal = bool(args.causal)
+        self.physical_gpu = args.physical_gpu
+        self.deadline = args.deadline
+        self.state_path = self.run_dir / "campaign_state.json"
+        self.candidate_dir = self.run_dir / "candidates"
+        self.candidate_dir.mkdir(parents=True, exist_ok=True)
+        if not self.state_path.exists():
+            self._write_state(
+                {
+                    "seq_len": self.seq_len,
+                    "causal": self.causal,
+                    "correctness_checks": [],
+                    "submissions": [],
+                    "best_candidate_id": None,
+                }
+            )
+
+    def _read_state(self) -> dict[str, Any]:
+        return json.loads(self.state_path.read_text())
+
+    def _write_state(self, state: dict[str, Any]) -> None:
+        temporary = self.state_path.with_suffix(".json.tmp")
+        temporary.write_text(json.dumps(state, indent=2, sort_keys=True) + "\n")
+        temporary.replace(self.state_path)
+
+    def _remaining(self) -> float:
+        return max(0.0, self.deadline - time.time())
+
+    def _minimum_target_tflops(self) -> float:
+        flops = 4.0 * 2 * 32 * self.seq_len * self.seq_len * 64
+        if self.causal:
+            flops /= 2.0
+        return max(1.0, flops / (45.0 * 1e12))
+
+    def status(self) -> dict[str, Any]:
+        state = self._read_state()
+        best = self._best(state)
+        return {
+            "target": "NVIDIA B200 (SM100), 750 W",
+            "workload": {
+                "shape": [2, 32, self.seq_len, 64],
+                "dtype": "float16",
+                "causal": self.causal,
+                "output": "attention output only",
+            },
+            "seconds_remaining": round(self._remaining(), 1),
+            "minimum_target_tflops": self._minimum_target_tflops(),
+            "submission_count": len(state["submissions"]),
+            "correctness_check_count": len(state.get("correctness_checks", [])),
+            "best": self._public_submission(best),
+            "recent_correctness_checks": [
+                self._public_submission(item)
+                for item in state.get("correctness_checks", [])[-4:]
+            ],
+            "recent_submissions": [
+                self._public_submission(item) for item in state["submissions"][-8:]
+            ],
+            "instructions": (
+                "Get a source to PASS test_candidate, submit that identical source, "
+                "then optimize only from verified sources while time remains."
+            ),
+        }
+
+    def _reference_path(self, value: str) -> Path:
+        candidate = (self.reference_root / value).resolve()
+        if (
+            candidate != self.reference_root
+            and self.reference_root not in candidate.parents
+        ):
+            raise ValueError("reference path escapes the bundled reference root")
+        if not candidate.is_file():
+            raise FileNotFoundError(f"unknown reference file: {value}")
+        return candidate
+
+    def list_references(self) -> dict[str, Any]:
+        files = []
+        for path in sorted(self.reference_root.rglob("*")):
+            if path.is_file():
+                files.append(
+                    {
+                        "path": str(path.relative_to(self.reference_root)),
+                        "bytes": path.stat().st_size,
+                    }
+                )
+        return {"files": files}
+
+    def read_reference(self, arguments: dict[str, Any]) -> dict[str, Any]:
+        path = self._reference_path(str(arguments["path"]))
+        start = int(arguments.get("start_line", 1))
+        maximum = min(int(arguments.get("max_lines", 200)), MAX_REFERENCE_LINES)
+        lines = path.read_text(errors="replace").splitlines()
+        selected = lines[start - 1 : start - 1 + maximum]
+        numbered = "\n".join(
+            f"{line_number}: {line}"
+            for line_number, line in enumerate(selected, start=start)
+        )
+        return {
+            "path": str(path.relative_to(self.reference_root)),
+            "start_line": start,
+            "end_line": start + len(selected) - 1,
+            "total_lines": len(lines),
+            "content": numbered,
+        }
+
+    def search_references(self, arguments: dict[str, Any]) -> dict[str, Any]:
+        query = str(arguments["query"])
+        if len(query) > 200:
+            raise ValueError("query is too long")
+        expression = re.compile(query, re.IGNORECASE)
+        maximum = min(int(arguments.get("max_results", 50)), MAX_SEARCH_RESULTS)
+        if arguments.get("path"):
+            paths = [self._reference_path(str(arguments["path"]))]
+        else:
+            paths = [path for path in self.reference_root.rglob("*") if path.is_file()]
+        matches = []
+        for path in sorted(paths):
+            for line_number, line in enumerate(
+                path.read_text(errors="replace").splitlines(), start=1
+            ):
+                if expression.search(line):
+                    matches.append(
+                        {
+                            "path": str(path.relative_to(self.reference_root)),
+                            "line": line_number,
+                            "text": line[:500],
+                        }
+                    )
+                    if len(matches) >= maximum:
+                        return {"matches": matches, "truncated": True}
+        return {"matches": matches, "truncated": False}
+
+    def _validate_source(self, source: str) -> None:
+        encoded = source.encode()
+        if len(encoded) > MAX_SOURCE_BYTES:
+            raise ValueError(
+                f"candidate is {len(encoded)} bytes; limit is {MAX_SOURCE_BYTES}"
+            )
+        lowered = source.lower()
+        found = [
+            fragment for fragment in BANNED_SOURCE_FRAGMENTS if fragment in lowered
+        ]
+        if found:
+            raise ValueError(f"candidate contains prohibited fragment(s): {found}")
+        tree = ast.parse(source)
+        imported_roots = set()
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Import):
+                imported_roots.update(alias.name.split(".")[0] for alias in node.names)
+            elif isinstance(node, ast.ImportFrom) and node.module:
+                imported_roots.add(node.module.split(".")[0])
+        unknown = sorted(imported_roots - ALLOWED_IMPORT_ROOTS)
+        if unknown:
+            raise ValueError(f"candidate imports non-allowlisted modules: {unknown}")
+        functions = {
+            node.name for node in tree.body if isinstance(node, ast.FunctionDef)
+        }
+        if "kernel_function" not in functions:
+            raise ValueError("candidate must define top-level kernel_function(q, k, v)")
+        if "cutlass" not in imported_roots or "cute.kernel" not in source:
+            raise ValueError("candidate must implement a CuTeDSL @cute.kernel")
+        tensor_core_markers = ("tcgen05", "cute.gemm", "make_tiled_mma", "mma_atom")
+        kernel_sources: dict[str, str] = {}
+        launched_kernels = set()
+        for node in ast.walk(tree):
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                decorators = " ".join(ast.unparse(item) for item in node.decorator_list)
+                if "cute.kernel" in decorators:
+                    kernel_sources[node.name] = (
+                        ast.get_source_segment(source, node) or ""
+                    )
+            if not isinstance(node, ast.Call):
+                continue
+            function = node.func
+            if not isinstance(function, ast.Attribute) or function.attr != "launch":
+                continue
+            value = function.value
+            if isinstance(value, ast.Call) and isinstance(value.func, ast.Name):
+                launched_kernels.add(value.func.id)
+        launched_sources = [
+            kernel_sources[name] for name in launched_kernels if name in kernel_sources
+        ]
+        if not launched_sources:
+            raise ValueError("candidate must launch a top-level @cute.kernel")
+        if not any(
+            any(marker in kernel_source.lower() for marker in tensor_core_markers)
+            for kernel_source in launched_sources
+        ):
+            raise ValueError(
+                "a launched @cute.kernel must perform a CuTe tensor-core MMA "
+                "operation; an unused gate kernel does not satisfy the backend contract"
+            )
+
+    def _sandbox_command(self, source_path: Path, mode: str) -> list[str]:
+        return [
+            str(self.setup_root / "sandbox_launcher.sh"),
+            str(self.setup_root / "evaluate_candidate.py.txt"),
+            "--source",
+            str(source_path),
+            "--seq-len",
+            str(self.seq_len),
+            "--causal",
+            str(int(self.causal)),
+            "--mode",
+            mode,
+        ]
+
+    def _sandbox_env(self) -> dict[str, str]:
+        environment = os.environ.copy()
+        environment.update(
+            {
+                "KERNELAGENT_ALLOWED_RUN_ROOT": str(self.run_dir),
+                "KERNELAGENT_SETUP_ROOT": str(self.setup_root),
+                "KERNELAGENT_PHYSICAL_GPU": str(self.physical_gpu),
+            }
+        )
+        return environment
+
+    @staticmethod
+    def _parse_evaluator_output(stdout: str) -> dict[str, Any]:
+        marker = "KERNELAGENT_RESULT="
+        for line in reversed(stdout.splitlines()):
+            if line.startswith(marker):
+                return json.loads(line[len(marker) :])
+        raise RuntimeError("candidate evaluator produced no result marker")
+
+    @staticmethod
+    def _run_subprocess(
+        command: list[str],
+        *,
+        cwd: Path,
+        environment: dict[str, str],
+        timeout: float,
+    ) -> subprocess.CompletedProcess[str]:
+        previous_mask = signal.pthread_sigmask(
+            signal.SIG_BLOCK, {signal.SIGINT, signal.SIGTERM}
+        )
+        try:
+            process = subprocess.Popen(
+                _command_restoring_signal_mask(command, previous_mask),
+                cwd=cwd,
+                env=environment,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                start_new_session=True,
+            )
+            _ACTIVE_PROCESS_GROUPS.add(process.pid)
+        finally:
+            signal.pthread_sigmask(signal.SIG_SETMASK, previous_mask)
+        try:
+            stdout, stderr = process.communicate(timeout=timeout)
+        except subprocess.TimeoutExpired as error:
+            _terminate_process_group(process)
+            stdout, stderr = process.communicate()
+            raise subprocess.TimeoutExpired(
+                error.cmd,
+                error.timeout,
+                output=stdout,
+                stderr=stderr,
+            ) from error
+        finally:
+            _ACTIVE_PROCESS_GROUPS.discard(process.pid)
+        return subprocess.CompletedProcess(command, process.returncode, stdout, stderr)
+
+    def submit(self, arguments: dict[str, Any]) -> dict[str, Any]:
+        source = str(arguments["source"])
+        source_hash = hashlib.sha256(source.encode()).hexdigest()
+        state = self._read_state()
+        for submission in state["submissions"]:
+            if submission["source_sha256"] == source_hash:
+                return {
+                    "duplicate": True,
+                    "result": self._public_submission(submission),
+                    "best": self._public_submission(self._best(state)),
+                    "seconds_remaining": round(self._remaining(), 1),
+                }
+
+        candidate_id = len(state["submissions"]) + 1
+        source_path = self.candidate_dir / f"candidate_{candidate_id:04d}.py"
+        submission: dict[str, Any] = {
+            "candidate_id": candidate_id,
+            "source_sha256": source_hash,
+            "source_path": str(source_path),
+            "hypothesis": str(arguments["hypothesis"])[:2000],
+            "mutation_family": str(arguments["mutation_family"])[:200],
+            "submitted_at_unix": time.time(),
+        }
+        try:
+            self._validate_source(source)
+            source_path.write_text(source)
+            remaining = self._remaining()
+            if remaining < 5:
+                raise TimeoutError("campaign deadline reached before evaluation")
+            timeout = max(1.0, min(remaining - 2.0, 180.0))
+            process = self._run_subprocess(
+                self._sandbox_command(source_path, "search"),
+                cwd=self.run_dir,
+                environment=self._sandbox_env(),
+                timeout=timeout,
+            )
+            try:
+                result = self._parse_evaluator_output(process.stdout)
+            except Exception as error:
+                result = {
+                    "status": "FAIL",
+                    "error_type": type(error).__name__,
+                    "error": (
+                        f"{error}; evaluator exit={process.returncode}; "
+                        f"stdout tail={process.stdout[-2000:]!r}; "
+                        f"stderr tail={process.stderr[-6000:]!r}"
+                    ),
+                }
+            submission.update(result)
+            submission["evaluator_exit_code"] = process.returncode
+            if process.returncode != 0 and result.get("status") == "PASS":
+                submission.update(
+                    status="FAIL",
+                    error=f"evaluator exited with status {process.returncode}",
+                )
+            if (
+                submission.get("status") == "PASS"
+                and float(submission.get("tflops", 0.0)) < self._minimum_target_tflops()
+            ):
+                measured = float(submission["tflops"])
+                minimum = self._minimum_target_tflops()
+                submission.update(
+                    status="FAIL",
+                    error_type="PerformanceGate",
+                    error=(
+                        f"candidate achieved {measured:.3f} TFLOP/s, below the "
+                        f"{minimum:.3f} TFLOP/s minimum needed to "
+                        "finish the target's nine-run final measurement"
+                    ),
+                )
+            if process.stderr:
+                submission["evaluator_stderr_tail"] = process.stderr[-4000:]
+        except subprocess.TimeoutExpired as error:
+            submission.update(
+                status="FAIL",
+                error_type="TimeoutExpired",
+                error=f"candidate evaluation exceeded {error.timeout:.1f}s",
+            )
+        except Exception as error:
+            submission.update(
+                status="FAIL",
+                error_type=type(error).__name__,
+                error=str(error),
+            )
+
+        state["submissions"].append(submission)
+        best = self._best(state)
+        if submission.get("status") == "PASS" and (
+            best is None or float(submission["median_ms"]) < float(best["median_ms"])
+        ):
+            state["best_candidate_id"] = candidate_id
+            best = submission
+        self._write_state(state)
+        return {
+            "duplicate": False,
+            "result": self._public_submission(submission),
+            "best": self._public_submission(best),
+            "seconds_remaining": round(self._remaining(), 1),
+        }
+
+    def test_candidate(self, arguments: dict[str, Any]) -> dict[str, Any]:
+        source = str(arguments["source"])
+        source_hash = hashlib.sha256(source.encode()).hexdigest()
+        state = self._read_state()
+        checks = state.setdefault("correctness_checks", [])
+        for check in checks:
+            if check["source_sha256"] == source_hash:
+                return {
+                    "duplicate": True,
+                    "result": self._public_submission(check),
+                    "seconds_remaining": round(self._remaining(), 1),
+                }
+
+        check_id = len(checks) + 1
+        source_path = self.candidate_dir / f"correctness_{check_id:04d}.py"
+        check: dict[str, Any] = {
+            "check_id": check_id,
+            "source_sha256": source_hash,
+            "source_path": str(source_path),
+            "hypothesis": str(arguments["hypothesis"])[:2000],
+            "checked_at_unix": time.time(),
+        }
+        try:
+            self._validate_source(source)
+            source_path.write_text(source)
+            remaining = self._remaining()
+            if remaining < 5:
+                raise TimeoutError("campaign deadline reached before correctness test")
+            timeout = max(1.0, min(remaining - 2.0, 180.0))
+            process = self._run_subprocess(
+                self._sandbox_command(source_path, "validate"),
+                cwd=self.run_dir,
+                environment=self._sandbox_env(),
+                timeout=timeout,
+            )
+            try:
+                result = self._parse_evaluator_output(process.stdout)
+            except Exception as error:
+                result = {
+                    "status": "FAIL",
+                    "error_type": type(error).__name__,
+                    "error": (
+                        f"{error}; evaluator exit={process.returncode}; "
+                        f"stdout tail={process.stdout[-2000:]!r}; "
+                        f"stderr tail={process.stderr[-6000:]!r}"
+                    ),
+                }
+            check.update(result)
+            check["evaluator_exit_code"] = process.returncode
+            if process.returncode != 0 and result.get("status") == "PASS":
+                check.update(
+                    status="FAIL",
+                    error=f"evaluator exited with status {process.returncode}",
+                )
+            if process.stderr:
+                check["evaluator_stderr_tail"] = process.stderr[-4000:]
+        except subprocess.TimeoutExpired as error:
+            check.update(
+                status="FAIL",
+                error_type="TimeoutExpired",
+                error=f"candidate correctness test exceeded {error.timeout:.1f}s",
+            )
+        except Exception as error:
+            check.update(
+                status="FAIL",
+                error_type=type(error).__name__,
+                error=str(error),
+            )
+
+        checks.append(check)
+        self._write_state(state)
+        response = {
+            "duplicate": False,
+            "result": self._public_submission(check),
+            "seconds_remaining": round(self._remaining(), 1),
+        }
+        if check.get("status") == "PASS":
+            response["next_action"] = (
+                "Call submit_candidate with this identical source for the "
+                "authoritative correctness rerun and timing."
+            )
+        return response
+
+    @staticmethod
+    def _public_submission(
+        submission: dict[str, Any] | None,
+    ) -> dict[str, Any] | None:
+        if submission is None:
+            return None
+        omitted = {"source_path", "evaluator_stderr_tail"}
+        return {key: value for key, value in submission.items() if key not in omitted}
+
+    @staticmethod
+    def _best(state: dict[str, Any]) -> dict[str, Any] | None:
+        candidate_id = state.get("best_candidate_id")
+        if candidate_id is None:
+            return None
+        return next(
+            item
+            for item in state["submissions"]
+            if item["candidate_id"] == candidate_id
+        )
+
+    def best_source(self) -> dict[str, Any]:
+        best = self._best(self._read_state())
+        if best is None:
+            return {"status": "NO_VERIFIED_CANDIDATE"}
+        return {
+            "status": "PASS",
+            "candidate": self._public_submission(best),
+            "source": Path(best["source_path"]).read_text(),
+        }
+
+    def profile_best(self) -> dict[str, Any]:
+        best = self._best(self._read_state())
+        if best is None:
+            return {"status": "NO_VERIFIED_CANDIDATE"}
+        remaining = self._remaining()
+        if remaining < 30:
+            return {
+                "status": "SKIP",
+                "reason": "less than 30 seconds remain in the campaign",
+            }
+        source_path = Path(best["source_path"])
+        command = [
+            str(self.setup_root / "sandbox_launcher.sh"),
+            "/usr/local/cuda/bin/ncu",
+            "--target-processes",
+            "all",
+            "--set",
+            "basic",
+            "--launch-count",
+            "1",
+            "--csv",
+            "/env/bin/python",
+            "-S",
+            str(self.setup_root / "evaluate_candidate.py.txt"),
+            "--source",
+            str(source_path),
+            "--seq-len",
+            str(self.seq_len),
+            "--causal",
+            str(int(self.causal)),
+            "--mode",
+            "invoke",
+        ]
+        try:
+            process = self._run_subprocess(
+                command,
+                cwd=self.run_dir,
+                environment=self._sandbox_env(),
+                timeout=max(1.0, min(remaining - 2.0, 300.0)),
+            )
+        except subprocess.TimeoutExpired as error:
+            return {"status": "FAIL", "error": f"NCU timed out after {error.timeout}s"}
+        report = (process.stdout + "\n" + process.stderr)[-60_000:]
+        return {
+            "status": "PASS" if process.returncode == 0 else "FAIL",
+            "exit_code": process.returncode,
+            "candidate_id": best["candidate_id"],
+            "report_tail": report,
+        }
+
+
+def _send(message: dict[str, Any]) -> None:
+    sys.stdout.write(json.dumps(message, separators=(",", ":")) + "\n")
+    sys.stdout.flush()
+
+
+def _text_result(payload: object, *, is_error: bool = False) -> dict[str, Any]:
+    return {
+        "content": [
+            {"type": "text", "text": json.dumps(payload, indent=2, sort_keys=True)}
+        ],
+        "isError": is_error,
+    }
+
+
+def serve(args: argparse.Namespace) -> None:
+    campaign = Campaign(args)
+    for line in sys.stdin:
+        try:
+            request = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        request_id = request.get("id")
+        if request_id is None:
+            continue
+        method = request.get("method")
+        if method == "initialize":
+            result = {
+                "protocolVersion": request.get("params", {}).get(
+                    "protocolVersion", "2025-06-18"
+                ),
+                "capabilities": {"tools": {"listChanged": False}},
+                "serverInfo": {
+                    "name": "kernelagent-closed-attention-campaign",
+                    "version": "v3-20260730",
+                },
+            }
+        elif method == "tools/list":
+            result = {"tools": TOOLS}
+        elif method == "tools/call":
+            params = request.get("params", {})
+            name = params.get("name")
+            arguments = params.get("arguments") or {}
+            try:
+                if name == "campaign_status":
+                    payload = campaign.status()
+                elif name == "list_references":
+                    payload = campaign.list_references()
+                elif name == "read_reference":
+                    payload = campaign.read_reference(arguments)
+                elif name == "search_references":
+                    payload = campaign.search_references(arguments)
+                elif name == "test_candidate":
+                    payload = campaign.test_candidate(arguments)
+                elif name == "submit_candidate":
+                    payload = campaign.submit(arguments)
+                elif name == "get_best_source":
+                    payload = campaign.best_source()
+                elif name == "profile_best":
+                    payload = campaign.profile_best()
+                else:
+                    raise ValueError(f"unknown tool {name!r}")
+                result = _text_result(payload)
+            except Exception as error:
+                result = _text_result(
+                    {"error_type": type(error).__name__, "error": str(error)},
+                    is_error=True,
+                )
+        elif method == "ping":
+            result = {}
+        else:
+            _send(
+                {
+                    "jsonrpc": "2.0",
+                    "id": request_id,
+                    "error": {"code": -32601, "message": "Method not found"},
+                }
+            )
+            continue
+        _send({"jsonrpc": "2.0", "id": request_id, "result": result})
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--run-dir", type=Path, required=True)
+    parser.add_argument("--reference-root", type=Path, required=True)
+    parser.add_argument("--seq-len", type=int, required=True)
+    parser.add_argument("--causal", type=int, choices=(0, 1), required=True)
+    parser.add_argument("--physical-gpu", type=int, choices=(6, 7), required=True)
+    parser.add_argument("--deadline", type=float, required=True)
+    return parser.parse_args()
+
+
+if __name__ == "__main__":
+    signal.signal(signal.SIGINT, _handle_signal)
+    signal.signal(signal.SIGTERM, _handle_signal)
+    serve(parse_args())

@@ -1,0 +1,902 @@
+from __future__ import annotations
+
+import time
+
+import torch
+import triton
+import triton.language as tl
+
+
+# ---------------------------------------------------------------------------
+# TMA availability
+# ---------------------------------------------------------------------------
+_HAS_TMA = False
+_SCRATCH: dict = {}
+try:
+    if hasattr(tl, "make_tensor_descriptor") and hasattr(triton, "set_allocator"):
+
+        def _tma_scratch_alloc(size, alignment, stream):
+            buf = _SCRATCH.get(size)
+            if buf is None:
+                buf = torch.empty(size, dtype=torch.int8, device="cuda")
+                _SCRATCH[size] = buf
+            return buf
+
+        triton.set_allocator(_tma_scratch_alloc)
+        _HAS_TMA = True
+except Exception:  # pragma: no cover
+    _HAS_TMA = False
+
+try:
+    from triton.tools.tensor_descriptor import TensorDescriptor as _TD
+    _HAS_HOST_TMA = hasattr(tl, "make_tensor_descriptor")
+except Exception:  # pragma: no cover
+    _TD = None
+    _HAS_HOST_TMA = False
+
+
+# ---------------------------------------------------------------------------
+# Packed half-precision exp2: two exponentials per MUFU slot.
+# ---------------------------------------------------------------------------
+@triton.jit
+def _exp2_f16x2(x):
+    return tl.inline_asm_elementwise(
+        "ex2.approx.f16x2 $0, $1;",
+        "=r,r",
+        [x],
+        dtype=tl.float16,
+        is_pure=True,
+        pack=2,
+    )
+
+
+@triton.jit
+def _rescale(acc, alpha, SUBTILE: tl.constexpr):
+    if SUBTILE:
+        BM: tl.constexpr = acc.shape[0]
+        BD: tl.constexpr = acc.shape[1]
+        a0, a1 = acc.reshape([BM, 2, BD // 2]).permute(0, 2, 1).split()
+        a0 = a0 * alpha[:, None]
+        a1 = a1 * alpha[:, None]
+        acc = tl.join(a0, a1).permute(0, 2, 1).reshape([BM, BD])
+    else:
+        acc = acc * alpha[:, None]
+    return acc
+
+
+# ---------------------------------------------------------------------------
+# Paired-Q-block kernel.
+#
+# One CTA owns two consecutive BLOCK_M row blocks (A and B) of the query
+# matrix.  They share every K/V tile and their dependency chains are
+# interleaved by hand so that the MUFU (exp2) burst of one block always has an
+# in-flight tensor-core MMA of the other block to overlap with.  This attacks
+# the measured problem directly: the tensor pipe was only 28.6% duty-cycled
+# even though it ran at full rate whenever active.
+# ---------------------------------------------------------------------------
+@triton.jit
+def _attn_fwd_pair(desc_q, desc_k, desc_v, desc_o, sm_scale, ROW_STRIDE,
+                   HEAD_DIM: tl.constexpr,
+                   BLOCK_M: tl.constexpr,
+                   BLOCK_N: tl.constexpr,
+                   WS: tl.constexpr,
+                   SUBTILE: tl.constexpr):
+    pid = tl.num_programs(0) - 1 - tl.program_id(0)
+    off_hz = tl.program_id(1)
+
+    base_y = off_hz * ROW_STRIDE
+    row_a = pid * (2 * BLOCK_M)
+    row_b = row_a + BLOCK_M
+    qk_scale = sm_scale * 1.44269504088896340736
+
+    qa_raw = desc_q.load([base_y + row_a, 0])
+    qb_raw = desc_q.load([base_y + row_b, 0])
+    qa = (qa_raw.to(tl.float32) * qk_scale).to(qa_raw.dtype)
+    qb = (qb_raw.to(tl.float32) * qk_scale).to(qb_raw.dtype)
+
+    offs_a = row_a + tl.arange(0, BLOCK_M)
+    offs_b = row_b + tl.arange(0, BLOCK_M)
+    offs_n0 = tl.arange(0, BLOCK_N)
+
+    m_a = tl.full([BLOCK_M], -float("inf"), dtype=tl.float32)
+    m_b = tl.full([BLOCK_M], -float("inf"), dtype=tl.float32)
+    l_a = tl.zeros([BLOCK_M], dtype=tl.float32)
+    l_b = tl.zeros([BLOCK_M], dtype=tl.float32)
+    acc_a = tl.zeros([BLOCK_M, HEAD_DIM], dtype=tl.float32)
+    acc_b = tl.zeros([BLOCK_M, HEAD_DIM], dtype=tl.float32)
+
+    anchor = tl.maximum(row_a - BLOCK_N, 0)
+
+    # ---- phase 1: online (exact fp32) softmax near the diagonal, block A ----
+    for start_n in tl.range(anchor, row_a + BLOCK_M, BLOCK_N):
+        start_n = tl.multiple_of(start_n, BLOCK_N)
+        offs_n = start_n + offs_n0
+        kT = tl.trans(desc_k.load([base_y + start_n, 0]))
+        v = desc_v.load([base_y + start_n, 0])
+        qk = tl.dot(qa, kT)
+        qk = qk + tl.where(offs_a[:, None] >= offs_n[None, :], 0.0, -1.0e6)
+        m_ij = tl.maximum(m_a, tl.max(qk, 1))
+        p = tl.math.exp2(qk - m_ij[:, None])
+        alpha = tl.math.exp2(m_a - m_ij)
+        l_a = l_a * alpha + tl.sum(p, 1)
+        acc_a = _rescale(acc_a, alpha, SUBTILE)
+        m_a = m_ij
+        acc_a = tl.dot(p.to(v.dtype), v, acc_a)
+
+    # ---- phase 1, block B ----
+    for start_n in tl.range(anchor, row_b + BLOCK_M, BLOCK_N):
+        start_n = tl.multiple_of(start_n, BLOCK_N)
+        offs_n = start_n + offs_n0
+        kT = tl.trans(desc_k.load([base_y + start_n, 0]))
+        v = desc_v.load([base_y + start_n, 0])
+        qk = tl.dot(qb, kT)
+        qk = qk + tl.where(offs_b[:, None] >= offs_n[None, :], 0.0, -1.0e6)
+        m_ij = tl.maximum(m_b, tl.max(qk, 1))
+        p = tl.math.exp2(qk - m_ij[:, None])
+        alpha = tl.math.exp2(m_b - m_ij)
+        l_b = l_b * alpha + tl.sum(p, 1)
+        acc_b = _rescale(acc_b, alpha, SUBTILE)
+        m_b = m_ij
+        acc_b = tl.dot(p.to(v.dtype), v, acc_b)
+
+    ma_h = m_a.to(tl.float16)
+    mb_h = m_b.to(tl.float16)
+    adj_a = tl.math.exp2(m_a - ma_h.to(tl.float32))
+    adj_b = tl.math.exp2(m_b - mb_h.to(tl.float32))
+    l_a = l_a * adj_a
+    l_b = l_b * adj_b
+    acc_a = acc_a * adj_a[:, None]
+    acc_b = acc_b * adj_b[:, None]
+
+    # ---- phase 2: frozen max, two interleaved dependency chains ----
+    for start_n in tl.range(0, anchor, BLOCK_N, warp_specialize=WS):
+        start_n = tl.multiple_of(start_n, BLOCK_N)
+        y0 = base_y + start_n
+        kT = tl.trans(desc_k.load([y0, 0]))
+        v = desc_v.load([y0, 0])
+        sa = tl.dot(qa, kT, out_dtype=tl.float16)
+        sb = tl.dot(qb, kT, out_dtype=tl.float16)
+        pa = _exp2_f16x2(sa - ma_h[:, None])
+        l_a += tl.sum(pa, 1).to(tl.float32)
+        acc_a = tl.dot(pa, v, acc_a)
+        pb = _exp2_f16x2(sb - mb_h[:, None])
+        l_b += tl.sum(pb, 1).to(tl.float32)
+        acc_b = tl.dot(pb, v, acc_b)
+
+    la_safe = tl.where(l_a > 0.0, l_a, 1.0)
+    lb_safe = tl.where(l_b > 0.0, l_b, 1.0)
+    acc_a = acc_a * (1.0 / la_safe)[:, None]
+    acc_b = acc_b * (1.0 / lb_safe)[:, None]
+    desc_o.store([base_y + row_a, 0], acc_a.to(qa_raw.dtype))
+    desc_o.store([base_y + row_b, 0], acc_b.to(qb_raw.dtype))
+
+
+# ---------------------------------------------------------------------------
+# Host-descriptor kernel (single Q block per CTA).
+# ---------------------------------------------------------------------------
+@triton.jit
+def _attn_fwd_hd(desc_q, desc_k, desc_v, desc_o, sm_scale, ROW_STRIDE,
+                 HEAD_DIM: tl.constexpr,
+                 BLOCK_M: tl.constexpr,
+                 BLOCK_N: tl.constexpr,
+                 WS: tl.constexpr,
+                 SUBTILE: tl.constexpr,
+                 MODE: tl.constexpr,
+                 UNROLL: tl.constexpr,
+                 ROT: tl.constexpr):
+    start_m = tl.num_programs(0) - 1 - tl.program_id(0)
+    off_hz = tl.program_id(1)
+
+    base_y = off_hz * ROW_STRIDE
+    row0 = start_m * BLOCK_M
+    qo_y = base_y + row0
+    qk_scale = sm_scale * 1.44269504088896340736
+
+    q_raw = desc_q.load([qo_y, 0])
+    q = (q_raw.to(tl.float32) * qk_scale).to(q_raw.dtype)
+
+    offs_m = row0 + tl.arange(0, BLOCK_M)
+    offs_n0 = tl.arange(0, BLOCK_N)
+
+    m_i = tl.full([BLOCK_M], -float("inf"), dtype=tl.float32)
+    l_i = tl.zeros([BLOCK_M], dtype=tl.float32)
+    acc = tl.zeros([BLOCK_M, HEAD_DIM], dtype=tl.float32)
+
+    UB: tl.constexpr = UNROLL * BLOCK_N
+    d0 = (row0 // BLOCK_N) * BLOCK_N
+    n_anchor = (tl.maximum(d0 - BLOCK_N, 0) // UB) * UB
+
+    # ---- phase 1: diagonal (masked) + anchor tiles, exact fp32 softmax ----
+    for start_n in tl.range(n_anchor, row0 + BLOCK_M, BLOCK_N):
+        start_n = tl.multiple_of(start_n, BLOCK_N)
+        offs_n = start_n + offs_n0
+        kT = tl.trans(desc_k.load([base_y + start_n, 0]))
+        v = desc_v.load([base_y + start_n, 0])
+        qk = tl.dot(q, kT)
+        qk = qk + tl.where(offs_m[:, None] >= offs_n[None, :], 0.0, -1.0e6)
+        m_ij = tl.maximum(m_i, tl.max(qk, 1))
+        p = tl.math.exp2(qk - m_ij[:, None])
+        alpha = tl.math.exp2(m_i - m_ij)
+        l_i = l_i * alpha + tl.sum(p, 1)
+        acc = _rescale(acc, alpha, SUBTILE)
+        m_i = m_ij
+        acc = tl.dot(p.to(v.dtype), v, acc)
+
+    m_h = m_i.to(tl.float16)
+    if MODE >= 2:
+        m_c = m_h.to(tl.float32)
+        adj = tl.math.exp2(m_i - m_c)
+        l_i = l_i * adj
+        acc = acc * adj[:, None]
+
+    # ---- phase 2: frozen max, no rescale ----
+    if ROT == 1:
+        if UNROLL == 2:
+            ka0 = tl.trans(desc_k.load([base_y, 0]))
+            ka1 = tl.trans(desc_k.load([base_y + BLOCK_N, 0]))
+            sa = tl.dot(q, ka0, out_dtype=tl.float16)
+            sb = tl.dot(q, ka1, out_dtype=tl.float16)
+            for start_n in tl.range(0, n_anchor, 2 * BLOCK_N,
+                                    warp_specialize=WS):
+                start_n = tl.multiple_of(start_n, 2 * BLOCK_N)
+                y0 = base_y + start_n
+                v0 = desc_v.load([y0, 0])
+                v1 = desc_v.load([y0 + BLOCK_N, 0])
+                k2T = tl.trans(desc_k.load([y0 + 2 * BLOCK_N, 0]))
+                s2 = tl.dot(q, k2T, out_dtype=tl.float16)
+                p0 = _exp2_f16x2(sa - m_h[:, None])
+                l_i += tl.sum(p0, 1).to(tl.float32)
+                acc = tl.dot(p0, v0, acc)
+                k3T = tl.trans(desc_k.load([y0 + 3 * BLOCK_N, 0]))
+                s3 = tl.dot(q, k3T, out_dtype=tl.float16)
+                p1 = _exp2_f16x2(sb - m_h[:, None])
+                l_i += tl.sum(p1, 1).to(tl.float32)
+                acc = tl.dot(p1, v1, acc)
+                sa = s2
+                sb = s3
+        else:
+            k0T = tl.trans(desc_k.load([base_y, 0]))
+            s_prev = tl.dot(q, k0T, out_dtype=tl.float16)
+            for start_n in tl.range(0, n_anchor, BLOCK_N, warp_specialize=WS):
+                start_n = tl.multiple_of(start_n, BLOCK_N)
+                y0 = base_y + start_n
+                v0 = desc_v.load([y0, 0])
+                kT = tl.trans(desc_k.load([y0 + BLOCK_N, 0]))
+                s_next = tl.dot(q, kT, out_dtype=tl.float16)
+                p = _exp2_f16x2(s_prev - m_h[:, None])
+                l_i += tl.sum(p, 1).to(tl.float32)
+                acc = tl.dot(p, v0, acc)
+                s_prev = s_next
+    elif UNROLL == 4:
+        if MODE == 5:
+            acc2 = tl.zeros([BLOCK_M, HEAD_DIM], dtype=tl.float32)
+        for start_n in tl.range(0, n_anchor, 4 * BLOCK_N, warp_specialize=WS):
+            start_n = tl.multiple_of(start_n, 4 * BLOCK_N)
+            y0 = base_y + start_n
+            k0T = tl.trans(desc_k.load([y0, 0]))
+            v0 = desc_v.load([y0, 0])
+            k1T = tl.trans(desc_k.load([y0 + BLOCK_N, 0]))
+            v1 = desc_v.load([y0 + BLOCK_N, 0])
+            k2T = tl.trans(desc_k.load([y0 + 2 * BLOCK_N, 0]))
+            v2 = desc_v.load([y0 + 2 * BLOCK_N, 0])
+            k3T = tl.trans(desc_k.load([y0 + 3 * BLOCK_N, 0]))
+            v3 = desc_v.load([y0 + 3 * BLOCK_N, 0])
+
+            s0 = tl.dot(q, k0T, out_dtype=tl.float16)
+            s1 = tl.dot(q, k1T, out_dtype=tl.float16)
+            p0 = _exp2_f16x2(s0 - m_h[:, None])
+            l_i += tl.sum(p0, 1).to(tl.float32)
+            acc = tl.dot(p0, v0, acc)
+
+            s2 = tl.dot(q, k2T, out_dtype=tl.float16)
+            p1 = _exp2_f16x2(s1 - m_h[:, None])
+            l_i += tl.sum(p1, 1).to(tl.float32)
+            if MODE == 5:
+                acc2 = tl.dot(p1, v1, acc2)
+            else:
+                acc = tl.dot(p1, v1, acc)
+
+            s3 = tl.dot(q, k3T, out_dtype=tl.float16)
+            p2 = _exp2_f16x2(s2 - m_h[:, None])
+            l_i += tl.sum(p2, 1).to(tl.float32)
+            acc = tl.dot(p2, v2, acc)
+
+            p3 = _exp2_f16x2(s3 - m_h[:, None])
+            l_i += tl.sum(p3, 1).to(tl.float32)
+            if MODE == 5:
+                acc2 = tl.dot(p3, v3, acc2)
+            else:
+                acc = tl.dot(p3, v3, acc)
+        if MODE == 5:
+            acc = acc + acc2
+    elif UNROLL == 2:
+        for start_n in tl.range(0, n_anchor, 2 * BLOCK_N, warp_specialize=WS):
+            start_n = tl.multiple_of(start_n, 2 * BLOCK_N)
+            y0 = base_y + start_n
+            k0T = tl.trans(desc_k.load([y0, 0]))
+            k1T = tl.trans(desc_k.load([y0 + BLOCK_N, 0]))
+            v0 = desc_v.load([y0, 0])
+            v1 = desc_v.load([y0 + BLOCK_N, 0])
+            if MODE >= 2:
+                s0 = tl.dot(q, k0T, out_dtype=tl.float16)
+                s1 = tl.dot(q, k1T, out_dtype=tl.float16)
+                p0 = _exp2_f16x2(s0 - m_h[:, None])
+                l0 = tl.sum(p0, 1)
+                acc = tl.dot(p0, v0, acc)
+                p1 = _exp2_f16x2(s1 - m_h[:, None])
+                l_i += (l0 + tl.sum(p1, 1)).to(tl.float32)
+                acc = tl.dot(p1, v1, acc)
+            else:
+                f0 = tl.dot(q, k0T)
+                f1 = tl.dot(q, k1T)
+                g0 = tl.math.exp2(f0 - m_i[:, None])
+                l0 = tl.sum(g0, 1)
+                acc = tl.dot(g0.to(v0.dtype), v0, acc)
+                g1 = tl.math.exp2(f1 - m_i[:, None])
+                l_i += l0 + tl.sum(g1, 1)
+                acc = tl.dot(g1.to(v1.dtype), v1, acc)
+    else:
+        for start_n in tl.range(0, n_anchor, BLOCK_N, warp_specialize=WS):
+            start_n = tl.multiple_of(start_n, BLOCK_N)
+            kT = tl.trans(desc_k.load([base_y + start_n, 0]))
+            v = desc_v.load([base_y + start_n, 0])
+            if MODE >= 2:
+                s = tl.dot(q, kT, out_dtype=tl.float16)
+                ph = _exp2_f16x2(s - m_h[:, None])
+                l_i += tl.sum(ph, 1).to(tl.float32)
+                acc = tl.dot(ph, v, acc)
+            else:
+                p = tl.math.exp2(tl.dot(q, kT) - m_i[:, None])
+                l_i += tl.sum(p, 1)
+                acc = tl.dot(p.to(v.dtype), v, acc)
+
+    l_safe = tl.where(l_i > 0.0, l_i, 1.0)
+    acc = acc * (1.0 / l_safe)[:, None]
+    desc_o.store([qo_y, 0], acc.to(q_raw.dtype))
+
+
+# ---------------------------------------------------------------------------
+# Device-descriptor kernel (fallback when host descriptors are unavailable).
+# ---------------------------------------------------------------------------
+@triton.jit
+def _attn_fwd_tma(Q, K, V, O, sm_scale, ROW_STRIDE, Y_DIM,
+                  HEAD_DIM: tl.constexpr,
+                  BLOCK_M: tl.constexpr,
+                  BLOCK_N: tl.constexpr,
+                  WS: tl.constexpr,
+                  SUBTILE: tl.constexpr,
+                  MODE: tl.constexpr,
+                  UNROLL: tl.constexpr):
+    start_m = tl.num_programs(0) - 1 - tl.program_id(0)
+    off_hz = tl.program_id(1)
+
+    desc_q = tl.make_tensor_descriptor(Q, shape=[Y_DIM, HEAD_DIM],
+                                       strides=[HEAD_DIM, 1],
+                                       block_shape=[BLOCK_M, HEAD_DIM])
+    desc_k = tl.make_tensor_descriptor(K, shape=[Y_DIM, HEAD_DIM],
+                                       strides=[HEAD_DIM, 1],
+                                       block_shape=[BLOCK_N, HEAD_DIM])
+    desc_v = tl.make_tensor_descriptor(V, shape=[Y_DIM, HEAD_DIM],
+                                       strides=[HEAD_DIM, 1],
+                                       block_shape=[BLOCK_N, HEAD_DIM])
+    desc_o = tl.make_tensor_descriptor(O, shape=[Y_DIM, HEAD_DIM],
+                                       strides=[HEAD_DIM, 1],
+                                       block_shape=[BLOCK_M, HEAD_DIM])
+
+    base_y = off_hz * ROW_STRIDE
+    row0 = start_m * BLOCK_M
+    qo_y = base_y + row0
+    qk_scale = sm_scale * 1.44269504088896340736
+
+    q_raw = desc_q.load([qo_y, 0])
+    q = (q_raw.to(tl.float32) * qk_scale).to(Q.dtype.element_ty)
+
+    offs_m = row0 + tl.arange(0, BLOCK_M)
+    offs_n0 = tl.arange(0, BLOCK_N)
+
+    m_i = tl.full([BLOCK_M], -float("inf"), dtype=tl.float32)
+    l_i = tl.zeros([BLOCK_M], dtype=tl.float32)
+    acc = tl.zeros([BLOCK_M, HEAD_DIM], dtype=tl.float32)
+
+    UB: tl.constexpr = UNROLL * BLOCK_N
+    d0 = (row0 // BLOCK_N) * BLOCK_N
+    n_anchor = (tl.maximum(d0 - BLOCK_N, 0) // UB) * UB
+
+    for start_n in tl.range(n_anchor, row0 + BLOCK_M, BLOCK_N):
+        start_n = tl.multiple_of(start_n, BLOCK_N)
+        offs_n = start_n + offs_n0
+        kT = tl.trans(desc_k.load([base_y + start_n, 0]))
+        v = desc_v.load([base_y + start_n, 0])
+        qk = tl.dot(q, kT)
+        qk = qk + tl.where(offs_m[:, None] >= offs_n[None, :], 0.0, -1.0e6)
+        m_ij = tl.maximum(m_i, tl.max(qk, 1))
+        p = tl.math.exp2(qk - m_ij[:, None])
+        alpha = tl.math.exp2(m_i - m_ij)
+        l_i = l_i * alpha + tl.sum(p, 1)
+        acc = _rescale(acc, alpha, SUBTILE)
+        m_i = m_ij
+        acc = tl.dot(p.to(v.dtype), v, acc)
+
+    m_h = m_i.to(tl.float16)
+    if MODE >= 2:
+        m_c = m_h.to(tl.float32)
+        adj = tl.math.exp2(m_i - m_c)
+        l_i = l_i * adj
+        acc = acc * adj[:, None]
+
+    if UNROLL == 2:
+        for start_n in tl.range(0, n_anchor, 2 * BLOCK_N, warp_specialize=WS):
+            start_n = tl.multiple_of(start_n, 2 * BLOCK_N)
+            y0 = base_y + start_n
+            k0T = tl.trans(desc_k.load([y0, 0]))
+            k1T = tl.trans(desc_k.load([y0 + BLOCK_N, 0]))
+            v0 = desc_v.load([y0, 0])
+            v1 = desc_v.load([y0 + BLOCK_N, 0])
+            if MODE >= 2:
+                s0 = tl.dot(q, k0T, out_dtype=tl.float16)
+                s1 = tl.dot(q, k1T, out_dtype=tl.float16)
+                p0 = _exp2_f16x2(s0 - m_h[:, None])
+                l0 = tl.sum(p0, 1)
+                acc = tl.dot(p0, v0, acc)
+                p1 = _exp2_f16x2(s1 - m_h[:, None])
+                l_i += (l0 + tl.sum(p1, 1)).to(tl.float32)
+                acc = tl.dot(p1, v1, acc)
+            else:
+                f0 = tl.dot(q, k0T)
+                f1 = tl.dot(q, k1T)
+                g0 = tl.math.exp2(f0 - m_i[:, None])
+                l0 = tl.sum(g0, 1)
+                acc = tl.dot(g0.to(v0.dtype), v0, acc)
+                g1 = tl.math.exp2(f1 - m_i[:, None])
+                l_i += l0 + tl.sum(g1, 1)
+                acc = tl.dot(g1.to(v1.dtype), v1, acc)
+    else:
+        for start_n in tl.range(0, n_anchor, BLOCK_N, warp_specialize=WS):
+            start_n = tl.multiple_of(start_n, BLOCK_N)
+            kT = tl.trans(desc_k.load([base_y + start_n, 0]))
+            v = desc_v.load([base_y + start_n, 0])
+            if MODE >= 2:
+                s = tl.dot(q, kT, out_dtype=tl.float16)
+                ph = _exp2_f16x2(s - m_h[:, None])
+                l_i += tl.sum(ph, 1).to(tl.float32)
+                acc = tl.dot(ph, v, acc)
+            else:
+                p = tl.math.exp2(tl.dot(q, kT) - m_i[:, None])
+                l_i += tl.sum(p, 1)
+                acc = tl.dot(p.to(v.dtype), v, acc)
+
+    l_safe = tl.where(l_i > 0.0, l_i, 1.0)
+    acc = acc * (1.0 / l_safe)[:, None]
+    desc_o.store([qo_y, 0], acc.to(O.dtype.element_ty))
+
+
+# ---------------------------------------------------------------------------
+# Pointer-based fallback kernel.
+# ---------------------------------------------------------------------------
+@triton.jit
+def _attn_fwd_ptr(Q, K, V, Out, sm_scale,
+                  stride_qz, stride_qh, stride_qm, stride_qk,
+                  stride_kz, stride_kh, stride_kn, stride_kk,
+                  stride_vz, stride_vh, stride_vn, stride_vk,
+                  stride_oz, stride_oh, stride_om, stride_ok,
+                  H, N_CTX,
+                  HEAD_DIM: tl.constexpr,
+                  BLOCK_M: tl.constexpr,
+                  BLOCK_N: tl.constexpr,
+                  EVEN: tl.constexpr,
+                  WS: tl.constexpr):
+    start_m = tl.num_programs(0) - 1 - tl.program_id(0)
+    off_hz = tl.program_id(1)
+    off_z = off_hz // H
+    off_h = off_hz % H
+
+    zh = off_z.to(tl.int64)
+    hh = off_h.to(tl.int64)
+    Q_base = Q + zh * stride_qz + hh * stride_qh
+    K_base = K + zh * stride_kz + hh * stride_kh
+    V_base = V + zh * stride_vz + hh * stride_vh
+    O_base = Out + zh * stride_oz + hh * stride_oh
+
+    row0 = start_m * BLOCK_M
+    offs_m = row0 + tl.arange(0, BLOCK_M)
+    offs_d = tl.arange(0, HEAD_DIM)
+    offs_n0 = tl.arange(0, BLOCK_N)
+
+    q_ptrs = Q_base + offs_m[:, None] * stride_qm + offs_d[None, :] * stride_qk
+    if EVEN:
+        q = tl.load(q_ptrs)
+    else:
+        q = tl.load(q_ptrs, mask=(offs_m[:, None] < N_CTX), other=0.0)
+
+    m_i = tl.full([BLOCK_M], -float("inf"), dtype=tl.float32)
+    l_i = tl.zeros([BLOCK_M], dtype=tl.float32)
+    acc = tl.zeros([BLOCK_M, HEAD_DIM], dtype=tl.float32)
+
+    qk_scale = sm_scale * 1.44269504088896340736
+    n_anchor = tl.maximum(row0 - BLOCK_N, 0)
+    hi = tl.minimum(row0 + BLOCK_M, N_CTX)
+
+    for start_n in tl.range(n_anchor, hi, BLOCK_N):
+        start_n = tl.multiple_of(start_n, BLOCK_N)
+        offs_n = start_n + offs_n0
+        k_ptrs = K_base + offs_n[None, :] * stride_kn + offs_d[:, None] * stride_kk
+        v_ptrs = V_base + offs_n[:, None] * stride_vn + offs_d[None, :] * stride_vk
+        if EVEN:
+            k = tl.load(k_ptrs)
+        else:
+            k = tl.load(k_ptrs, mask=offs_n[None, :] < N_CTX, other=0.0)
+        qk = tl.dot(q, k) * qk_scale
+        qk = qk + tl.where(offs_m[:, None] >= offs_n[None, :], 0.0, -1.0e6)
+        m_ij = tl.maximum(m_i, tl.max(qk, 1))
+        p = tl.math.exp2(qk - m_ij[:, None])
+        alpha = tl.math.exp2(m_i - m_ij)
+        l_i = l_i * alpha + tl.sum(p, 1)
+        acc = acc * alpha[:, None]
+        m_i = m_ij
+        if EVEN:
+            v = tl.load(v_ptrs)
+        else:
+            v = tl.load(v_ptrs, mask=offs_n[:, None] < N_CTX, other=0.0)
+        acc = tl.dot(p.to(v.dtype), v, acc)
+
+    for start_n in tl.range(0, n_anchor, BLOCK_N, warp_specialize=WS):
+        start_n = tl.multiple_of(start_n, BLOCK_N)
+        offs_n = start_n + offs_n0
+        k = tl.load(K_base + offs_n[None, :] * stride_kn
+                    + offs_d[:, None] * stride_kk)
+        qk = tl.dot(q, k)
+        p = tl.math.exp2(qk * qk_scale - m_i[:, None])
+        l_i += tl.sum(p, 1)
+        v = tl.load(V_base + offs_n[:, None] * stride_vn
+                    + offs_d[None, :] * stride_vk)
+        acc = tl.dot(p.to(v.dtype), v, acc)
+
+    l_safe = tl.where(l_i > 0.0, l_i, 1.0)
+    acc = acc * (1.0 / l_safe)[:, None]
+
+    o_ptrs = O_base + offs_m[:, None] * stride_om + offs_d[None, :] * stride_ok
+    if EVEN:
+        tl.store(o_ptrs, acc.to(Out.dtype.element_ty))
+    else:
+        tl.store(o_ptrs, acc.to(Out.dtype.element_ty),
+                 mask=(offs_m[:, None] < N_CTX))
+
+
+# ---------------------------------------------------------------------------
+# Launch helpers
+# ---------------------------------------------------------------------------
+def _tma_layout_ok(tensors, HEAD_DIM):
+    if not _HAS_TMA:
+        return None
+    row_stride = None
+    for t in tensors:
+        if t.dtype not in (torch.float16, torch.bfloat16):
+            return None
+        Z, H, N, D = t.shape
+        if t.stride(3) != 1 or t.stride(2) != HEAD_DIM:
+            return None
+        if t.stride(1) % HEAD_DIM != 0:
+            return None
+        rs = t.stride(1) // HEAD_DIM
+        if t.stride(0) != H * t.stride(1):
+            return None
+        if row_stride is None:
+            row_stride = rs
+        elif row_stride != rs:
+            return None
+    return row_stride
+
+
+# shape tuple = (BM, BN, num_warps, num_stages, ws, maxnreg, subtile,
+#                mode, unroll, rot)
+def _tma_shapes(HEAD_DIM, fp16):
+    if HEAD_DIM <= 64:
+        s = []
+        if fp16:
+            s += [
+                (128, 128, 8, 3, True, None, True, 2, 1, 1),
+                (128, 128, 8, 2, True, None, True, 2, 1, 1),
+                (128, 128, 8, 4, True, None, True, 2, 1, 1),
+                (128, 128, 8, 5, True, None, True, 2, 1, 1),
+                (128, 128, 8, 3, False, None, True, 2, 1, 1),
+                (128, 128, 8, 3, True, 128, True, 2, 1, 1),
+                (128, 128, 8, 3, True, None, True, 2, 2, 1),
+                (128, 64, 8, 4, True, None, True, 2, 1, 1),
+                (128, 64, 8, 3, False, None, True, 2, 1, 1),
+                (128, 64, 8, 3, True, 128, True, 2, 1, 1),
+                (64, 128, 4, 3, True, None, True, 2, 1, 1),
+                (64, 64, 4, 3, True, None, True, 2, 1, 1),
+                # previous best family (non-rotated)
+                (128, 128, 8, 3, True, None, True, 2, 2, 0),
+                (128, 128, 8, 2, True, None, True, 2, 2, 0),
+                (128, 128, 8, 3, True, None, True, 2, 1, 0),
+            ]
+        s += [
+            (128, 128, 8, 3, True, None, True, 0, 2, 0),
+            (128, 128, 8, 3, True, 80, True, 0, 1, 0),
+            (128, 64, 8, 4, True, 80, True, 0, 1, 0),
+        ]
+        return s
+    if HEAD_DIM == 128:
+        s = []
+        if fp16:
+            s += [
+                (128, 128, 8, 3, True, None, True, 2, 1, 1),
+                (128, 128, 8, 2, True, None, True, 2, 1, 1),
+                (128, 128, 8, 3, False, None, True, 2, 1, 1),
+                (128, 64, 8, 3, True, None, True, 2, 1, 1),
+                (128, 64, 8, 4, True, 168, True, 2, 1, 1),
+                (128, 128, 8, 3, True, 168, True, 2, 1, 0),
+                (128, 128, 8, 2, True, None, True, 2, 2, 0),
+                (128, 64, 8, 3, True, 168, True, 2, 1, 0),
+                (128, 128, 4, 3, True, None, True, 2, 1, 0),
+            ]
+        s += [
+            (128, 128, 8, 3, True, 168, True, 0, 1, 0),
+            (128, 64, 8, 3, True, 168, True, 0, 1, 0),
+        ]
+        return s
+    return [(64, 64, 4, 2, False, None, False, 0, 1, 0)]
+
+
+# Paired-Q-block candidates: two independent softmax/MMA chains per CTA so the
+# MUFU (exp2) pipe and the tensor pipe overlap instead of alternating.
+def _pair_shapes(HEAD_DIM):
+    if HEAD_DIM <= 64:
+        return [
+            (128, 128, 8, 2, True, None, True, 2, 1, 0),
+            (128, 128, 8, 3, True, None, True, 2, 1, 0),
+            (128, 128, 8, 2, False, None, True, 2, 1, 0),
+            (128, 128, 8, 4, True, None, True, 2, 1, 0),
+            (128, 64, 8, 3, True, None, True, 2, 1, 0),
+            (128, 64, 8, 4, True, None, True, 2, 1, 0),
+        ]
+    if HEAD_DIM == 128:
+        return [
+            (128, 64, 8, 2, True, None, True, 2, 1, 0),
+            (128, 64, 8, 3, True, None, True, 2, 1, 0),
+            (128, 128, 8, 2, True, None, True, 2, 1, 0),
+        ]
+    return []
+
+
+def _ptr_base(HEAD_DIM):
+    if HEAD_DIM <= 64:
+        return [
+            ("ptr", 128, 64, 8, 3, False, None, False, 0, 1, 0),
+            ("ptr", 128, 128, 8, 3, True, None, False, 0, 1, 0),
+            ("ptr", 128, 64, 4, 2, False, None, False, 0, 1, 0),
+        ]
+    if HEAD_DIM == 128:
+        return [
+            ("ptr", 128, 64, 8, 2, False, None, False, 0, 1, 0),
+            ("ptr", 64, 64, 4, 2, False, None, False, 0, 1, 0),
+        ]
+    return [
+        ("ptr", 64, 64, 4, 2, False, None, False, 0, 1, 0),
+        ("ptr", 64, 32, 4, 2, False, None, False, 0, 1, 0),
+    ]
+
+
+def _valid(cfg, N_CTX):
+    kind, BM, BN = cfg[0], cfg[1], cfg[2]
+    mode, ur, rot = cfg[8], cfg[9], cfg[10]
+    if kind == "pair":
+        if N_CTX % (2 * BM) != 0 or N_CTX % BN != 0:
+            return False
+        return BM % BN == 0 and rot == 0
+    if N_CTX % BM != 0 or N_CTX % BN != 0:
+        return False
+    if kind == "ptr":
+        return BM % BN == 0 and rot == 0
+    if rot and kind != "hd":
+        return False
+    if BM % BN != 0 and BN % BM != 0:
+        return False
+    if rot and (mode < 2 or ur > 2):
+        return False
+    if ur == 4 and mode < 2:
+        return False
+    if kind == "tma" and ur == 4:
+        return False
+    return True
+
+
+def _tma_candidates(HEAD_DIM, fp16, kind):
+    cands = []
+    if kind == "hd" and fp16:
+        cands += [("pair",) + s for s in _pair_shapes(HEAD_DIM)]
+    cands += [(kind,) + s for s in _tma_shapes(HEAD_DIM, fp16)]
+    return cands
+
+
+def _desc(t, HEAD_DIM, rows, block_m):
+    flat = t.as_strided((rows, HEAD_DIM), (HEAD_DIM, 1))
+    return _TD.from_tensor(flat, [block_m, HEAD_DIM])
+
+
+def _launch(cfg, q, k, v, out, sm_scale, Z, H, N_CTX, HEAD_DIM, row_stride):
+    kind, BM, BN, nw, ns, ws, mr, st, mode, ur, rot = cfg
+    extra = {} if mr is None else {"maxnreg": mr}
+    if kind == "pair":
+        grid = (N_CTX // (2 * BM), Z * H, 1)
+        rows = Z * H * row_stride
+        dq = _desc(q, HEAD_DIM, rows, BM)
+        dk = _desc(k, HEAD_DIM, rows, BN)
+        dv = _desc(v, HEAD_DIM, rows, BN)
+        do = _desc(out, HEAD_DIM, rows, BM)
+        _attn_fwd_pair[grid](
+            dq, dk, dv, do, sm_scale, row_stride,
+            HEAD_DIM=HEAD_DIM, BLOCK_M=BM, BLOCK_N=BN, WS=ws, SUBTILE=st,
+            num_warps=nw, num_stages=ns, **extra,
+        )
+    elif kind == "hd":
+        grid = (N_CTX // BM, Z * H, 1)
+        rows = Z * H * row_stride
+        dq = _desc(q, HEAD_DIM, rows, BM)
+        dk = _desc(k, HEAD_DIM, rows, BN)
+        dv = _desc(v, HEAD_DIM, rows, BN)
+        do = _desc(out, HEAD_DIM, rows, BM)
+        _attn_fwd_hd[grid](
+            dq, dk, dv, do, sm_scale, row_stride,
+            HEAD_DIM=HEAD_DIM, BLOCK_M=BM, BLOCK_N=BN, WS=ws, SUBTILE=st,
+            MODE=mode, UNROLL=ur, ROT=rot, num_warps=nw, num_stages=ns,
+            **extra,
+        )
+    elif kind == "tma":
+        grid = (N_CTX // BM, Z * H, 1)
+        _attn_fwd_tma[grid](
+            q, k, v, out, sm_scale, row_stride, Z * H * row_stride,
+            HEAD_DIM=HEAD_DIM, BLOCK_M=BM, BLOCK_N=BN, WS=ws, SUBTILE=st,
+            MODE=mode, UNROLL=ur, num_warps=nw, num_stages=ns, **extra,
+        )
+    else:
+        grid = (triton.cdiv(N_CTX, BM), Z * H, 1)
+        even = (N_CTX % BM == 0) and (N_CTX % BN == 0)
+        _attn_fwd_ptr[grid](
+            q, k, v, out, sm_scale,
+            q.stride(0), q.stride(1), q.stride(2), q.stride(3),
+            k.stride(0), k.stride(1), k.stride(2), k.stride(3),
+            v.stride(0), v.stride(1), v.stride(2), v.stride(3),
+            out.stride(0), out.stride(1), out.stride(2), out.stride(3),
+            H, N_CTX,
+            HEAD_DIM=HEAD_DIM, BLOCK_M=BM, BLOCK_N=BN, EVEN=even, WS=ws,
+            num_warps=nw, num_stages=ns, **extra,
+        )
+
+
+_CFG_CACHE: dict = {}
+
+
+def _time_cfg(cfg, qb, kb, vb, ob, sm_scale, Z, H, n_b, HEAD_DIM, row_stride,
+              reps=5):
+    try:
+        _launch(cfg, qb, kb, vb, ob, sm_scale, Z, H, n_b, HEAD_DIM, row_stride)
+        _launch(cfg, qb, kb, vb, ob, sm_scale, Z, H, n_b, HEAD_DIM, row_stride)
+        torch.cuda.synchronize()
+    except Exception:
+        return float("inf")
+    best = float("inf")
+    try:
+        for _ in range(reps):
+            torch.cuda.synchronize()
+            t0 = time.perf_counter()
+            _launch(cfg, qb, kb, vb, ob, sm_scale, Z, H, n_b, HEAD_DIM,
+                    row_stride)
+            torch.cuda.synchronize()
+            dt = time.perf_counter() - t0
+            if dt < best:
+                best = dt
+    except Exception:
+        return float("inf")
+    return best
+
+
+def _pick_config(q, k, v, out, sm_scale, Z, H, N_CTX, HEAD_DIM, row_stride,
+                 fp16):
+    n_b = min(N_CTX, 16384)
+    qb, kb, vb, ob = (t[:, :, :n_b] for t in (q, k, v, out))
+
+    host_ok = (_HAS_HOST_TMA and row_stride is not None
+               and q.is_contiguous() and k.is_contiguous()
+               and v.is_contiguous() and out.is_contiguous())
+    prim = "hd" if host_ok else ("tma" if row_stride is not None else None)
+
+    cands = []
+    if prim is not None:
+        cands = [c for c in _tma_candidates(HEAD_DIM, fp16, prim)
+                 if _valid(c, N_CTX) and _valid(c, n_b)]
+
+    scored = []
+    for cfg in cands:
+        dt = _time_cfg(cfg, qb, kb, vb, ob, sm_scale, Z, H, n_b, HEAD_DIM,
+                       row_stride, reps=3)
+        scored.append((dt, cfg))
+    scored.sort(key=lambda x: x[0])
+
+    best, best_t = None, float("inf")
+    for dt, cfg in scored[:5]:
+        if dt == float("inf"):
+            continue
+        t = _time_cfg(cfg, qb, kb, vb, ob, sm_scale, Z, H, n_b, HEAD_DIM,
+                      row_stride, reps=7)
+        if t < best_t:
+            best_t, best = t, cfg
+
+    if (best is not None and best[0] == "hd" and best[10] == 0
+            and row_stride is not None):
+        twin = ("tma",) + tuple(best[1:])
+        if _valid(twin, N_CTX) and _valid(twin, n_b):
+            t = _time_cfg(twin, qb, kb, vb, ob, sm_scale, Z, H, n_b, HEAD_DIM,
+                          row_stride, reps=7)
+            if t < best_t:
+                best_t, best = t, twin
+
+    if best is None:
+        for cfg in _ptr_base(HEAD_DIM):
+            if not (_valid(cfg, N_CTX) and _valid(cfg, n_b)):
+                continue
+            t = _time_cfg(cfg, qb, kb, vb, ob, sm_scale, Z, H, n_b, HEAD_DIM,
+                          row_stride, reps=5)
+            if t < best_t:
+                best_t, best = t, cfg
+    if best is None:
+        raise RuntimeError("no viable Triton launch configuration for attention")
+    return best
+
+
+def kernel_function(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor,
+                    sm_scale: float | None = None) -> torch.Tensor:
+    """
+    Causal scaled-dot-product attention fused into a single Triton kernel:
+    QK^T -> 1/sqrt(d) scaling (folded into Q) -> causal mask (block skipping)
+    -> streaming softmax -> P@V -> normalization -> store.
+    """
+    if not (q.is_cuda and k.is_cuda and v.is_cuda):
+        raise ValueError("q, k, v must all be CUDA tensors")
+    if q.shape != k.shape or q.shape != v.shape:
+        raise ValueError("q, k, v must have identical shapes")
+    if q.dim() != 4:
+        raise ValueError("expected 4-D tensors [batch, heads, seq, head_dim]")
+    if q.dtype != k.dtype or q.dtype != v.dtype:
+        raise ValueError("q, k, v must share a dtype")
+
+    Z, H, N_CTX, HEAD_DIM = q.shape
+    if HEAD_DIM not in (16, 32, 64, 128, 256):
+        raise ValueError(f"unsupported head_dim: {HEAD_DIM}")
+
+    if sm_scale is None:
+        sm_scale = 1.0 / (HEAD_DIM ** 0.5)
+
+    out = torch.empty_like(q)
+    row_stride = _tma_layout_ok((q, k, v, out), HEAD_DIM)
+    fp16 = (q.dtype == torch.float16)
+
+    key = (Z, H, N_CTX, HEAD_DIM, q.dtype, q.stride(), k.stride(), v.stride())
+    cfg = _CFG_CACHE.get(key)
+    if cfg is None:
+        cfg = _pick_config(q, k, v, out, sm_scale, Z, H, N_CTX, HEAD_DIM,
+                           row_stride, fp16)
+        _CFG_CACHE[key] = cfg
+
+    try:
+        _launch(cfg, q, k, v, out, sm_scale, Z, H, N_CTX, HEAD_DIM, row_stride)
+    except Exception:
+        fallback = None
+        alts = []
+        if row_stride is not None:
+            alts += [c for c in _tma_candidates(HEAD_DIM, fp16, "tma")
+                     if _valid(c, N_CTX)]
+        alts += [c for c in _ptr_base(HEAD_DIM) if _valid(c, N_CTX)]
+        for c in alts:
+            try:
+                _launch(c, q, k, v, out, sm_scale, Z, H, N_CTX, HEAD_DIM,
+                        row_stride)
+                fallback = c
+                break
+            except Exception:
+                continue
+        if fallback is None:
+            raise
+        _CFG_CACHE[key] = fallback
+    return out

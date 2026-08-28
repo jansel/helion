@@ -1,0 +1,634 @@
+{
+  "kernelagent_commit": "e0647170da36ef9b059ac0bd3d60103aa4ed378b",
+  "kernelagent_version_label": "0.1.0.dev+e0647170",
+  "model": "claude-opus-5",
+  "claude_code_version": "2.1.220",
+  "runs": [
+    {
+      "run": "dense_32768_1x",
+      "variant": "dense",
+      "seq_len": 32768,
+      "budget_label": "1x",
+      "budget_seconds": 708.6,
+      "elapsed_seconds": 708.8697686800733,
+      "physical_gpu": 7,
+      "selection": {
+        "internal_time_ms": 80.85300827026367,
+        "program_id": "initial",
+        "parent_id": null,
+        "generation": 0,
+        "ptx_hash": null
+      },
+      "selected_source_sha256": "a935b0923c41ff5fd1964263569312eeafe00fde6c7e80adab2490d0b2ab4be4",
+      "driver_sha256": "b6f9d98000d417064a09e06ac2a1596f0bd9eac92dd7f78bec5e8da507e546ac",
+      "candidate_count": 5,
+      "max_generation": 1,
+      "claude_calls_completed": 18,
+      "claude_cost_usd": 3.8297862499999997,
+      "web_search_requests": 0,
+      "canonical_models": [
+        "claude-opus-5"
+      ]
+    },
+    {
+      "run": "dense_65536_1x",
+      "variant": "dense",
+      "seq_len": 65536,
+      "budget_label": "1x",
+      "budget_seconds": 840.9,
+      "elapsed_seconds": 841.2212559552863,
+      "physical_gpu": 7,
+      "selection": {
+        "internal_time_ms": 136.52996317545572,
+        "program_id": "r1_w1",
+        "parent_id": "initial",
+        "generation": 1,
+        "ptx_hash": null
+      },
+      "selected_source_sha256": "340e9587393f11cbeae9f95e8706099607356a44aad897bc3e2eaa70d9e4016e",
+      "driver_sha256": "c6bf360f24d05383d231681b498a80404b89f368710dcb7f2e9322252f86cea8",
+      "candidate_count": 5,
+      "max_generation": 1,
+      "claude_calls_completed": 13,
+      "claude_cost_usd": 3.94378,
+      "web_search_requests": 0,
+      "canonical_models": [
+        "claude-opus-5"
+      ]
+    },
+    {
+      "run": "dense_131072_1x",
+      "variant": "dense",
+      "seq_len": 131072,
+      "budget_label": "1x",
+      "budget_seconds": 1386.7,
+      "elapsed_seconds": 1387.0159387895837,
+      "physical_gpu": 7,
+      "selection": {
+        "internal_time_ms": 626.1021118164062,
+        "program_id": "r1_w0",
+        "parent_id": "initial",
+        "generation": 1,
+        "ptx_hash": null
+      },
+      "selected_source_sha256": "c8257937ecd3ac98cc6d58c4284fe442ba94cdf24f860b5d0efb2e0f5084a3fb",
+      "driver_sha256": "c6bf360f24d05383d231681b498a80404b89f368710dcb7f2e9322252f86cea8",
+      "candidate_count": 5,
+      "max_generation": 1,
+      "claude_calls_completed": 23,
+      "claude_cost_usd": 8.87183,
+      "web_search_requests": 0,
+      "canonical_models": [
+        "claude-opus-5"
+      ]
+    },
+    {
+      "run": "dense_262144_1x",
+      "variant": "dense",
+      "seq_len": 262144,
+      "budget_label": "1x",
+      "budget_seconds": 3682.7,
+      "elapsed_seconds": 3683.2694193804637,
+      "physical_gpu": 7,
+      "selection": {
+        "internal_time_ms": 1900.484619140625,
+        "program_id": "r3_w2",
+        "parent_id": "r1_w0",
+        "generation": 3,
+        "ptx_hash": null
+      },
+      "selected_source_sha256": "d272bd5908b863cec612df56c92da60bc9ea4466c4e72881c0c4a77ebd0fdec5",
+      "driver_sha256": "c6bf360f24d05383d231681b498a80404b89f368710dcb7f2e9322252f86cea8",
+      "candidate_count": 12,
+      "max_generation": 3,
+      "claude_calls_completed": 44,
+      "claude_cost_usd": 20.213587750000002,
+      "web_search_requests": 0,
+      "canonical_models": [
+        "claude-opus-5"
+      ]
+    },
+    {
+      "run": "causal_65536_1x",
+      "variant": "causal",
+      "seq_len": 65536,
+      "budget_label": "1x",
+      "budget_seconds": 3732.2,
+      "elapsed_seconds": 3732.47151889652,
+      "physical_gpu": 6,
+      "selection": {
+        "internal_time_ms": 148.15099080403647,
+        "program_id": "r1_w3",
+        "parent_id": "initial",
+        "generation": 1,
+        "ptx_hash": null
+      },
+      "selected_source_sha256": "1a0f79e935cb4355427838d10d4fa67f06da57222b511c802bc276faa2ec97fc",
+      "driver_sha256": "c6bf360f24d05383d231681b498a80404b89f368710dcb7f2e9322252f86cea8",
+      "candidate_count": 10,
+      "max_generation": 3,
+      "claude_calls_completed": 43,
+      "claude_cost_usd": 16.7099935,
+      "web_search_requests": 0,
+      "canonical_models": [
+        "claude-opus-5"
+      ]
+    },
+    {
+      "run": "causal_131072_1x",
+      "variant": "causal",
+      "seq_len": 131072,
+      "budget_label": "1x",
+      "budget_seconds": 3374.6,
+      "elapsed_seconds": 3374.8705340446904,
+      "physical_gpu": 6,
+      "selection": {
+        "internal_time_ms": 217.82288360595703,
+        "program_id": "r3_w1",
+        "parent_id": "r2_w3",
+        "generation": 3,
+        "ptx_hash": null
+      },
+      "selected_source_sha256": "a22162fda7528cf5913f182130c7498cb46946749e2755cb807f626a05d2e055",
+      "driver_sha256": "b6f9d98000d417064a09e06ac2a1596f0bd9eac92dd7f78bec5e8da507e546ac",
+      "candidate_count": 9,
+      "max_generation": 3,
+      "claude_calls_completed": 39,
+      "claude_cost_usd": 17.61079625,
+      "web_search_requests": 0,
+      "canonical_models": [
+        "claude-opus-5"
+      ]
+    },
+    {
+      "run": "causal_262144_1x",
+      "variant": "causal",
+      "seq_len": 262144,
+      "budget_label": "1x",
+      "budget_seconds": 5619.4,
+      "elapsed_seconds": 5619.972416102886,
+      "physical_gpu": 6,
+      "selection": {
+        "internal_time_ms": 1003.5794677734375,
+        "program_id": "r4_w1",
+        "parent_id": "r3_w2",
+        "generation": 4,
+        "ptx_hash": null
+      },
+      "selected_source_sha256": "de6e916d05d41fe7af1d640d5010cd685e638f0a55278cb9bb6c8ea39017d091",
+      "driver_sha256": "b6f9d98000d417064a09e06ac2a1596f0bd9eac92dd7f78bec5e8da507e546ac",
+      "candidate_count": 14,
+      "max_generation": 4,
+      "claude_calls_completed": 56,
+      "claude_cost_usd": 25.09019125,
+      "web_search_requests": 0,
+      "canonical_models": [
+        "claude-opus-5"
+      ]
+    },
+    {
+      "run": "causal_524288_1x",
+      "variant": "causal",
+      "seq_len": 524288,
+      "budget_label": "1x",
+      "budget_seconds": 2413.9,
+      "elapsed_seconds": 2414.417325244285,
+      "physical_gpu": 6,
+      "selection": {
+        "internal_time_ms": 4834.85693359375,
+        "program_id": "r2_w2",
+        "parent_id": "initial",
+        "generation": 2,
+        "ptx_hash": null
+      },
+      "selected_source_sha256": "5f8f136d7427a5c60428adb7efe77e64d3b421210231a00e8f56e03d52cae2fc",
+      "driver_sha256": "b6f9d98000d417064a09e06ac2a1596f0bd9eac92dd7f78bec5e8da507e546ac",
+      "candidate_count": 7,
+      "max_generation": 2,
+      "claude_calls_completed": 27,
+      "claude_cost_usd": 11.082559,
+      "web_search_requests": 0,
+      "canonical_models": [
+        "claude-opus-5"
+      ]
+    },
+    {
+      "run": "dense_32768_2x",
+      "variant": "dense",
+      "seq_len": 32768,
+      "budget_label": "2x",
+      "budget_seconds": 1417.2,
+      "elapsed_seconds": 1417.4702314091846,
+      "physical_gpu": 7,
+      "selection": {
+        "internal_time_ms": 33.4420420328776,
+        "program_id": "r1_w0",
+        "parent_id": "initial",
+        "generation": 1,
+        "ptx_hash": null
+      },
+      "selected_source_sha256": "27ebf9dddf2df974d38b16d0d243de65d2ab945cc4fc1164f8f091d622c0eeac",
+      "driver_sha256": "b6f9d98000d417064a09e06ac2a1596f0bd9eac92dd7f78bec5e8da507e546ac",
+      "candidate_count": 3,
+      "max_generation": 1,
+      "claude_calls_completed": 20,
+      "claude_cost_usd": 5.2726815,
+      "web_search_requests": 0,
+      "canonical_models": [
+        "claude-opus-5"
+      ]
+    },
+    {
+      "run": "dense_65536_2x",
+      "variant": "dense",
+      "seq_len": 65536,
+      "budget_label": "2x",
+      "budget_seconds": 1681.8,
+      "elapsed_seconds": 1682.0700112041086,
+      "physical_gpu": 7,
+      "selection": {
+        "internal_time_ms": 124.36099052429199,
+        "program_id": "r1_w0",
+        "parent_id": "initial",
+        "generation": 1,
+        "ptx_hash": null
+      },
+      "selected_source_sha256": "0c7b8f9cb706e4c88ad7e462468835886dbb84d32b62336c5562752188c04d85",
+      "driver_sha256": "b6f9d98000d417064a09e06ac2a1596f0bd9eac92dd7f78bec5e8da507e546ac",
+      "candidate_count": 4,
+      "max_generation": 1,
+      "claude_calls_completed": 20,
+      "claude_cost_usd": 7.28255,
+      "web_search_requests": 0,
+      "canonical_models": [
+        "claude-opus-5"
+      ]
+    },
+    {
+      "run": "dense_131072_2x",
+      "variant": "dense",
+      "seq_len": 131072,
+      "budget_label": "2x",
+      "budget_seconds": 2773.4,
+      "elapsed_seconds": 2773.718083148822,
+      "physical_gpu": 7,
+      "selection": {
+        "internal_time_ms": 550.350830078125,
+        "program_id": "r2_w0",
+        "parent_id": "r1_w0",
+        "generation": 2,
+        "ptx_hash": null
+      },
+      "selected_source_sha256": "74b233cb0aa5980738d2d9de504caf5c924171b37ab6f6bbf7f543e902b2b489",
+      "driver_sha256": "b6f9d98000d417064a09e06ac2a1596f0bd9eac92dd7f78bec5e8da507e546ac",
+      "candidate_count": 7,
+      "max_generation": 2,
+      "claude_calls_completed": 35,
+      "claude_cost_usd": 16.16093125,
+      "web_search_requests": 0,
+      "canonical_models": [
+        "claude-opus-5"
+      ]
+    },
+    {
+      "run": "dense_262144_2x",
+      "variant": "dense",
+      "seq_len": 262144,
+      "budget_label": "2x",
+      "budget_seconds": 7365.4,
+      "elapsed_seconds": 7365.921844912693,
+      "physical_gpu": 7,
+      "selection": {
+        "internal_time_ms": 1758.634033203125,
+        "program_id": "r7_w2",
+        "parent_id": "r5_w0",
+        "generation": 7,
+        "ptx_hash": null
+      },
+      "selected_source_sha256": "5e5addcb985958f43e0f474d9f56d31f0e20eb42602cc773e0a9f5414781de06",
+      "driver_sha256": "b6f9d98000d417064a09e06ac2a1596f0bd9eac92dd7f78bec5e8da507e546ac",
+      "candidate_count": 27,
+      "max_generation": 7,
+      "claude_calls_completed": 93,
+      "claude_cost_usd": 40.81577575,
+      "web_search_requests": 0,
+      "canonical_models": [
+        "claude-opus-5"
+      ]
+    },
+    {
+      "run": "causal_65536_2x",
+      "variant": "causal",
+      "seq_len": 65536,
+      "budget_label": "2x",
+      "budget_seconds": 7464.4,
+      "elapsed_seconds": 7464.722353552468,
+      "physical_gpu": 6,
+      "selection": {
+        "internal_time_ms": 49.503580474853514,
+        "program_id": "r6_w2",
+        "parent_id": "r4_w0",
+        "generation": 6,
+        "ptx_hash": null
+      },
+      "selected_source_sha256": "3f82348a231489d87156ba9642c134802512a1561e8fa991efcca890aaf9c5e4",
+      "driver_sha256": "b6f9d98000d417064a09e06ac2a1596f0bd9eac92dd7f78bec5e8da507e546ac",
+      "candidate_count": 24,
+      "max_generation": 7,
+      "claude_calls_completed": 85,
+      "claude_cost_usd": 44.2427705,
+      "web_search_requests": 0,
+      "canonical_models": [
+        "claude-opus-5"
+      ]
+    },
+    {
+      "run": "causal_131072_2x",
+      "variant": "causal",
+      "seq_len": 131072,
+      "budget_label": "2x",
+      "budget_seconds": 6749.2,
+      "elapsed_seconds": 6749.469767777249,
+      "physical_gpu": 6,
+      "selection": {
+        "internal_time_ms": 259.1047668457031,
+        "program_id": "r2_w2",
+        "parent_id": "initial",
+        "generation": 2,
+        "ptx_hash": null
+      },
+      "selected_source_sha256": "751e061f629b9b4e80380f740c9b2729bb5e6754a1741671416cb8135d465140",
+      "driver_sha256": "b6f9d98000d417064a09e06ac2a1596f0bd9eac92dd7f78bec5e8da507e546ac",
+      "candidate_count": 19,
+      "max_generation": 7,
+      "claude_calls_completed": 78,
+      "claude_cost_usd": 33.727842,
+      "web_search_requests": 0,
+      "canonical_models": [
+        "claude-opus-5"
+      ]
+    },
+    {
+      "run": "causal_262144_2x",
+      "variant": "causal",
+      "seq_len": 262144,
+      "budget_label": "2x",
+      "budget_seconds": 11238.8,
+      "elapsed_seconds": 11239.228698334657,
+      "physical_gpu": 6,
+      "selection": {
+        "internal_time_ms": 863.6692504882812,
+        "program_id": "r12_w1",
+        "parent_id": "r11_w2",
+        "generation": 12,
+        "ptx_hash": null
+      },
+      "selected_source_sha256": "5b5f4edab766906dbd577aeb1421c225e23196ffb186e5892d995680d729acc3",
+      "driver_sha256": "b6f9d98000d417064a09e06ac2a1596f0bd9eac92dd7f78bec5e8da507e546ac",
+      "candidate_count": 39,
+      "max_generation": 12,
+      "claude_calls_completed": 134,
+      "claude_cost_usd": 72.1190765,
+      "web_search_requests": 0,
+      "canonical_models": [
+        "claude-opus-5"
+      ]
+    },
+    {
+      "run": "causal_524288_2x",
+      "variant": "causal",
+      "seq_len": 524288,
+      "budget_label": "2x",
+      "budget_seconds": 4827.8,
+      "elapsed_seconds": 4828.067244385369,
+      "physical_gpu": 6,
+      "selection": {
+        "internal_time_ms": 3257.838623046875,
+        "program_id": "r3_w3",
+        "parent_id": "r2_w0",
+        "generation": 3,
+        "ptx_hash": null
+      },
+      "selected_source_sha256": "d7cce2ea8ac3addd96d681bb706a5397a9a74777f4a400529d495ed50361b8c7",
+      "driver_sha256": "b6f9d98000d417064a09e06ac2a1596f0bd9eac92dd7f78bec5e8da507e546ac",
+      "candidate_count": 12,
+      "max_generation": 3,
+      "claude_calls_completed": 53,
+      "claude_cost_usd": 24.973782,
+      "web_search_requests": 0,
+      "canonical_models": [
+        "claude-opus-5"
+      ]
+    },
+    {
+      "run": "dense_32768_10x",
+      "variant": "dense",
+      "seq_len": 32768,
+      "budget_label": "10x",
+      "budget_seconds": 7086.0,
+      "elapsed_seconds": 7086.267377788201,
+      "physical_gpu": 7,
+      "selection": {
+        "internal_time_ms": 26.49335419504266,
+        "program_id": "r9_w2",
+        "parent_id": "r8_w1",
+        "generation": 9,
+        "ptx_hash": null
+      },
+      "selected_source_sha256": "f96e4be805f0ac164c0b74b3b18d6e8ed5c290b9e44beb147ef93da94133301e",
+      "driver_sha256": "463a326e568d9aa502512db99481c43569165c8a6b517b5312c88c2df327e44f",
+      "candidate_count": 31,
+      "max_generation": 9,
+      "claude_calls_completed": 111,
+      "claude_cost_usd": 41.48742025,
+      "web_search_requests": 0,
+      "canonical_models": [
+        "claude-opus-5"
+      ]
+    },
+    {
+      "run": "dense_65536_10x",
+      "variant": "dense",
+      "seq_len": 65536,
+      "budget_label": "10x",
+      "budget_seconds": 8409.0,
+      "elapsed_seconds": 8409.271570201032,
+      "physical_gpu": 7,
+      "selection": {
+        "internal_time_ms": 99.1023162841797,
+        "program_id": "r9_w3",
+        "parent_id": "r8_w0",
+        "generation": 9,
+        "ptx_hash": null
+      },
+      "selected_source_sha256": "ea7ef785a3531d3157efcad90367afdf968af2d64cbd218377ca623318081bd7",
+      "driver_sha256": "463a326e568d9aa502512db99481c43569165c8a6b517b5312c88c2df327e44f",
+      "candidate_count": 34,
+      "max_generation": 9,
+      "claude_calls_completed": 111,
+      "claude_cost_usd": 56.588046,
+      "web_search_requests": 0,
+      "canonical_models": [
+        "claude-opus-5"
+      ]
+    },
+    {
+      "run": "dense_131072_10x",
+      "variant": "dense",
+      "seq_len": 131072,
+      "budget_label": "10x",
+      "budget_seconds": 13867.0,
+      "elapsed_seconds": 13867.321020604111,
+      "physical_gpu": 7,
+      "selection": {
+        "internal_time_ms": 388.99407958984375,
+        "program_id": "r10_w1",
+        "parent_id": "r8_w0",
+        "generation": 10,
+        "ptx_hash": null
+      },
+      "selected_source_sha256": "c6030636ee3447992215a7f6685b215d57e497dfe99f7f3551ee0396c3dc312b",
+      "driver_sha256": "463a326e568d9aa502512db99481c43569165c8a6b517b5312c88c2df327e44f",
+      "candidate_count": 56,
+      "max_generation": 15,
+      "claude_calls_completed": 191,
+      "claude_cost_usd": 86.158429,
+      "web_search_requests": 0,
+      "canonical_models": [
+        "claude-opus-5"
+      ]
+    },
+    {
+      "run": "dense_262144_10x",
+      "variant": "dense",
+      "seq_len": 262144,
+      "budget_label": "10x",
+      "budget_seconds": 36827.0,
+      "elapsed_seconds": 36827.32119154837,
+      "physical_gpu": 7,
+      "selection": {
+        "internal_time_ms": 1708.6290283203125,
+        "program_id": "r36_w3",
+        "parent_id": "r30_w1",
+        "generation": 36,
+        "ptx_hash": null
+      },
+      "selected_source_sha256": "2ae2e1f403f0697a333c428a9beb31de3aea3ce7aaed562a988b587fc6dc6663",
+      "driver_sha256": "463a326e568d9aa502512db99481c43569165c8a6b517b5312c88c2df327e44f",
+      "candidate_count": 138,
+      "max_generation": 41,
+      "claude_calls_completed": 448,
+      "claude_cost_usd": 226.127935,
+      "web_search_requests": 0,
+      "canonical_models": [
+        "claude-opus-5"
+      ]
+    },
+    {
+      "run": "causal_65536_10x",
+      "variant": "causal",
+      "seq_len": 65536,
+      "budget_label": "10x",
+      "budget_seconds": 37322.0,
+      "elapsed_seconds": 37322.31916500162,
+      "physical_gpu": 6,
+      "selection": {
+        "internal_time_ms": 50.15245742797852,
+        "program_id": "r39_w1",
+        "parent_id": "r32_w2",
+        "generation": 39,
+        "ptx_hash": null
+      },
+      "selected_source_sha256": "d53a1eadbe89d1a816581b41ba49835d4a190f50079c6549173cce45ab9fd305",
+      "driver_sha256": "463a326e568d9aa502512db99481c43569165c8a6b517b5312c88c2df327e44f",
+      "candidate_count": 138,
+      "max_generation": 40,
+      "claude_calls_completed": 472,
+      "claude_cost_usd": 247.4168515,
+      "web_search_requests": 0,
+      "canonical_models": [
+        "claude-opus-5"
+      ]
+    },
+    {
+      "run": "causal_131072_10x",
+      "variant": "causal",
+      "seq_len": 131072,
+      "budget_label": "10x",
+      "budget_seconds": 33746.0,
+      "elapsed_seconds": 33746.32204776071,
+      "physical_gpu": 6,
+      "selection": {
+        "internal_time_ms": 209.40596771240234,
+        "program_id": "r15_w3",
+        "parent_id": "r12_w0",
+        "generation": 15,
+        "ptx_hash": null
+      },
+      "selected_source_sha256": "38edd00d8a49c2721d90cd9c68d59ec5c1119a9d2ef6176e82c94f3f5f2ef29c",
+      "driver_sha256": "463a326e568d9aa502512db99481c43569165c8a6b517b5312c88c2df327e44f",
+      "candidate_count": 119,
+      "max_generation": 45,
+      "claude_calls_completed": 429,
+      "claude_cost_usd": 203.62465,
+      "web_search_requests": 0,
+      "canonical_models": [
+        "claude-opus-5"
+      ]
+    },
+    {
+      "run": "causal_262144_10x",
+      "variant": "causal",
+      "seq_len": 262144,
+      "budget_label": "10x",
+      "budget_seconds": 56194.0,
+      "elapsed_seconds": 56194.31937548984,
+      "physical_gpu": 6,
+      "selection": {
+        "internal_time_ms": 760.7060546875,
+        "program_id": "r20_w2",
+        "parent_id": "r17_w3",
+        "generation": 20,
+        "ptx_hash": null
+      },
+      "selected_source_sha256": "42de638580e056fb7df39212080c99b78e1c16515afc1c51de76ea8cc9a39355",
+      "driver_sha256": "463a326e568d9aa502512db99481c43569165c8a6b517b5312c88c2df327e44f",
+      "candidate_count": 194,
+      "max_generation": 58,
+      "claude_calls_completed": 650,
+      "claude_cost_usd": 374.9666585,
+      "web_search_requests": 0,
+      "canonical_models": [
+        "claude-opus-5"
+      ]
+    },
+    {
+      "run": "causal_524288_10x",
+      "variant": "causal",
+      "seq_len": 524288,
+      "budget_label": "10x",
+      "budget_seconds": 24139.0,
+      "elapsed_seconds": 24139.317858028226,
+      "physical_gpu": 6,
+      "selection": {
+        "internal_time_ms": 3314.987060546875,
+        "program_id": "r16_w2",
+        "parent_id": "r14_w0",
+        "generation": 16,
+        "ptx_hash": null
+      },
+      "selected_source_sha256": "13248e8c13761007b417871e741e6cdb8f408d818a74c3a5b66b97ce3425490e",
+      "driver_sha256": "463a326e568d9aa502512db99481c43569165c8a6b517b5312c88c2df327e44f",
+      "candidate_count": 68,
+      "max_generation": 21,
+      "claude_calls_completed": 250,
+      "claude_cost_usd": 131.49476825,
+      "web_search_requests": 0,
+      "canonical_models": [
+        "claude-opus-5"
+      ]
+    }
+  ],
+  "total_claude_cost_usd": 1719.812692,
+  "total_completed_claude_calls": 3443
+}

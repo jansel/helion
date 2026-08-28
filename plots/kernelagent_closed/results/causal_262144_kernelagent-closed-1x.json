@@ -1,0 +1,58 @@
+{
+  "accuracy": "PASS",
+  "benchmark_timer": "event",
+  "best_ms": 5373.90576171875,
+  "best_tflops": 104.75620124035488,
+  "config": {
+    "budget_label": "1x",
+    "budget_seconds": 5619.4,
+    "elapsed_seconds": 5619.463653802872,
+    "selection": {
+      "candidate_id": 71,
+      "hypothesis": "The score/value stride has a sharp optimum near 268: SN=264 was slower and SN=272 regressed severely. Test the remaining midpoint SN=266 with the confirmed SK=72, SO=68 configuration.",
+      "median_ms": 5374.95556640625,
+      "mutation_family": "smem-score-padding-isolation",
+      "source_sha256": "20e4d29a206326cdb7bc1e99914d7dcf2c7400c2dfff5bf8d9a1797b98f77ee6",
+      "tflops": 104.73574087566013
+    },
+    "source_sha256": "20e4d29a206326cdb7bc1e99914d7dcf2c7400c2dfff5bf8d9a1797b98f77ee6"
+  },
+  "flop_model": "softmax_attention_forward",
+  "gpu": "NVIDIA B200",
+  "impl": "kernelagent-closed-1x",
+  "mean_ms": 5374.539605034723,
+  "median_ms": 5374.546875,
+  "median_tflops": 104.74370519306561,
+  "mom_median_ms": 5374.546875,
+  "mom_median_tflops": 104.74370519306561,
+  "notes": [
+    "KernelAgent Closed wall-clock tuning budget 5619.4s (1x); elapsed 5619.5s.",
+    "Selected source sha256 20e4d29a206326cdb7bc1e99914d7dcf2c7400c2dfff5bf8d9a1797b98f77ee6; candidate 71; internal search time 5374.95556640625 ms.",
+    "GPT-5.6 had only a controlled CuTeDSL campaign MCP; no shell, web, arbitrary file, subagent, Helion, or FlashAttention access. Generated kernels ran in a network-isolated sandbox."
+  ],
+  "physical_gpu": "6",
+  "power_cap_w": 750,
+  "runs_ms": [
+    5374.546875,
+    5374.458984375,
+    5374.607421875,
+    5374.8994140625,
+    5373.90576171875,
+    5374.4619140625,
+    5374.751953125,
+    5374.95361328125,
+    5374.2705078125
+  ],
+  "shape": {
+    "biased": 0,
+    "causal": 1,
+    "dtype": "float16",
+    "h": 32,
+    "head_dim": 64,
+    "seq_len": 262144,
+    "z": 2
+  },
+  "std_ms": 0.323518796686853,
+  "version": "KernelAgent v3-20260730; GPT-5.6; CuTe 4.5.1",
+  "version_label": "KernelAgent v3-20260730 / GPT-5.6 / CuTe 4.5.1"
+}

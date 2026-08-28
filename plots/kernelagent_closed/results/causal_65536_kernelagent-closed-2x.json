@@ -1,0 +1,58 @@
+{
+  "accuracy": "PASS",
+  "benchmark_timer": "event",
+  "best_ms": 522.6640625,
+  "best_tflops": 67.31737384150455,
+  "config": {
+    "budget_label": "2x",
+    "budget_seconds": 7464.4,
+    "elapsed_seconds": 7464.513857841492,
+    "selection": {
+      "candidate_id": 31,
+      "hypothesis": "Hold the QK UMMA consumer token through probability generation, then release it after each thread's P stores and async-proxy fence. The PV producer acquire becomes the all-thread handoff, replacing the remaining CTA barrier.",
+      "median_ms": 520.5227661132812,
+      "mutation_family": "barrier-handoff",
+      "source_sha256": "1b5f13ed3f51d76b419738753e290efc4790df2a6adbbde8cb8a384e5158cb2d",
+      "tflops": 67.59430015242567
+    },
+    "source_sha256": "1b5f13ed3f51d76b419738753e290efc4790df2a6adbbde8cb8a384e5158cb2d"
+  },
+  "flop_model": "softmax_attention_forward",
+  "gpu": "NVIDIA B200",
+  "impl": "kernelagent-closed-2x",
+  "mean_ms": 525.9342719184028,
+  "median_ms": 524.4406127929688,
+  "median_tflops": 67.08933524704271,
+  "mom_median_ms": 524.4406127929688,
+  "mom_median_tflops": 67.08933524704271,
+  "notes": [
+    "KernelAgent Closed wall-clock tuning budget 7464.4s (2x); elapsed 7464.5s.",
+    "Selected source sha256 1b5f13ed3f51d76b419738753e290efc4790df2a6adbbde8cb8a384e5158cb2d; candidate 31; internal search time 520.5227661132812 ms.",
+    "GPT-5.6 had only a controlled CuTeDSL campaign MCP; no shell, web, arbitrary file, subagent, Helion, or FlashAttention access. Generated kernels ran in a network-isolated sandbox."
+  ],
+  "physical_gpu": "6",
+  "power_cap_w": 750,
+  "runs_ms": [
+    524.4406127929688,
+    522.734619140625,
+    524.189697265625,
+    522.8523559570312,
+    527.0220947265625,
+    539.041748046875,
+    522.6640625,
+    524.8839721679688,
+    525.5792846679688
+  ],
+  "shape": {
+    "biased": 0,
+    "causal": 1,
+    "dtype": "float16",
+    "h": 32,
+    "head_dim": 64,
+    "seq_len": 65536,
+    "z": 2
+  },
+  "std_ms": 5.122538997750152,
+  "version": "KernelAgent v3-20260730; GPT-5.6; CuTe 4.5.1",
+  "version_label": "KernelAgent v3-20260730 / GPT-5.6 / CuTe 4.5.1"
+}

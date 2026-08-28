@@ -1,0 +1,306 @@
+"""
+Fused causal FlashAttention-2 style forward kernel in Triton (Blackwell tuned).
+
+Key change vs. the previous version: the inner K/V loop can be *compute*
+software-pipelined (PIPELINE=1).  The QK^T MMA of tile n+1 is issued *before*
+the online-softmax (exp2 / max / sum) of tile n, so the tensor pipe and the
+MUFU/FMA pipes overlap instead of serializing on the loop-carried dependency
+chain.  For HEAD_DIM=64 the exp2 work per KV tile costs roughly as many SM
+cycles as the two MMAs, so this overlap is the dominant lever for the
+"UNDERUTILIZED" (latency/dependency bound) profile.
+
+The pipelined / non-pipelined variants and the pipeline depth are selected
+empirically with triton.autotune (isolated A/B of a single knob each), with a
+hard fallback launch in case a config cannot be compiled on the target device.
+"""
+
+from __future__ import annotations
+
+import torch
+import triton
+import triton.language as tl
+
+
+# ---------------------------------------------------------------------------
+# Inner loop over K/V tiles.
+#   STAGE == 1 : strictly-below-diagonal tiles (no elementwise mask needed)
+#   STAGE == 2 : the diagonal tile (needs the causal elementwise mask)
+# ---------------------------------------------------------------------------
+@triton.jit
+def _attn_fwd_inner(acc, l_i, m_i, q,
+                    K_block_ptr, V_block_ptr,
+                    start_m, qk_scale, N_CTX,
+                    offs_m, offs_n,
+                    BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr,
+                    HEAD_DIM: tl.constexpr,
+                    STAGE: tl.constexpr, EVEN_N: tl.constexpr,
+                    PIPELINE: tl.constexpr):
+    if STAGE == 1:
+        lo = 0
+        hi = start_m * BLOCK_M
+    else:
+        lo = start_m * BLOCK_M
+        hi = tl.minimum((start_m + 1) * BLOCK_M, N_CTX)
+        lo = tl.multiple_of(lo, BLOCK_M)
+
+    K_block_ptr = tl.advance(K_block_ptr, (0, lo))
+    V_block_ptr = tl.advance(V_block_ptr, (lo, 0))
+
+    if (STAGE == 1) and (PIPELINE == 1) and EVEN_N:
+        # ---------------- compute-pipelined (unmasked) loop ----------------
+        # Prologue: score tile for the first K block.  When hi == lo (start_m
+        # == 0) this loads the in-bounds tile at column 0 and the result is
+        # simply discarded, so no runtime branch is required.
+        k = tl.load(K_block_ptr)
+        qk_cur = tl.dot(q, k)
+        K_block_ptr = tl.advance(K_block_ptr, (0, BLOCK_N))
+
+        for _start_n in range(lo, hi, BLOCK_N):
+            # Issue the *independent* MMA for the next tile first; the tensor
+            # cores crunch it while the XU/FMA pipes run the softmax below.
+            k = tl.load(K_block_ptr)
+            qk_nxt = tl.dot(q, k)
+
+            m_ij = tl.maximum(m_i, tl.max(qk_cur, 1) * qk_scale)
+            p = tl.math.exp2(qk_cur * qk_scale - m_ij[:, None])
+            l_ij = tl.sum(p, 1)
+            alpha = tl.math.exp2(m_i - m_ij)
+            l_i = l_i * alpha + l_ij
+            acc = acc * alpha[:, None]
+
+            v = tl.load(V_block_ptr)
+            acc = tl.dot(p.to(v.dtype), v, acc)
+
+            m_i = m_ij
+            qk_cur = qk_nxt
+            K_block_ptr = tl.advance(K_block_ptr, (0, BLOCK_N))
+            V_block_ptr = tl.advance(V_block_ptr, (BLOCK_N, 0))
+    else:
+        # ---------------- generic loop (also used for the diagonal) --------
+        for start_n in range(lo, hi, BLOCK_N):
+            start_n = tl.multiple_of(start_n, BLOCK_N)
+
+            if EVEN_N:
+                k = tl.load(K_block_ptr)
+            else:
+                k = tl.load(K_block_ptr, boundary_check=(1,), padding_option="zero")
+            qk = tl.dot(q, k)
+
+            if STAGE == 2:
+                causal = offs_m[:, None] >= (start_n + offs_n[None, :])
+                qk = qk * qk_scale + tl.where(causal, 0.0, -1.0e6)
+                m_ij = tl.maximum(m_i, tl.max(qk, 1))
+                qk = qk - m_ij[:, None]
+            else:
+                m_ij = tl.maximum(m_i, tl.max(qk, 1) * qk_scale)
+                qk = qk * qk_scale - m_ij[:, None]
+
+            p = tl.math.exp2(qk)
+            l_ij = tl.sum(p, 1)
+            alpha = tl.math.exp2(m_i - m_ij)
+            l_i = l_i * alpha + l_ij
+            acc = acc * alpha[:, None]
+
+            if EVEN_N:
+                v = tl.load(V_block_ptr)
+            else:
+                v = tl.load(V_block_ptr, boundary_check=(0,), padding_option="zero")
+            acc = tl.dot(p.to(v.dtype), v, acc)
+
+            m_i = m_ij
+            K_block_ptr = tl.advance(K_block_ptr, (0, BLOCK_N))
+            V_block_ptr = tl.advance(V_block_ptr, (BLOCK_N, 0))
+
+    return acc, l_i, m_i
+
+
+@triton.jit
+def _attn_fwd_kernel(Q, K, V, Out, sm_scale,
+                     stride_qz, stride_qh, stride_qm,
+                     stride_kz, stride_kh, stride_kn,
+                     stride_vz, stride_vh, stride_vn,
+                     stride_oz, stride_oh, stride_om,
+                     H, N_CTX,
+                     HEAD_DIM: tl.constexpr,
+                     BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr,
+                     EVEN_M: tl.constexpr, EVEN_N: tl.constexpr,
+                     PIPELINE: tl.constexpr):
+    pid = tl.program_id(0)
+    off_hz = tl.program_id(1)
+
+    num_m_blocks = tl.cdiv(N_CTX, BLOCK_M)
+
+    # Causal attention makes the per-row-block work triangular.  Pair a "light"
+    # block with a "heavy" one so consecutively scheduled programs have roughly
+    # equal cost (better SM occupancy / tail behaviour).
+    half = pid // 2
+    if (pid % 2) == 0:
+        start_m = half
+    else:
+        start_m = num_m_blocks - 1 - half
+
+    off_z = off_hz // H
+    off_h = off_hz % H
+
+    q_base = Q + off_z * stride_qz + off_h * stride_qh
+    k_base = K + off_z * stride_kz + off_h * stride_kh
+    v_base = V + off_z * stride_vz + off_h * stride_vh
+    o_base = Out + off_z * stride_oz + off_h * stride_oh
+
+    Q_block_ptr = tl.make_block_ptr(
+        base=q_base, shape=(N_CTX, HEAD_DIM), strides=(stride_qm, 1),
+        offsets=(start_m * BLOCK_M, 0), block_shape=(BLOCK_M, HEAD_DIM),
+        order=(1, 0))
+    # K is loaded already transposed: [HEAD_DIM, BLOCK_N], contiguous dim 0.
+    K_block_ptr = tl.make_block_ptr(
+        base=k_base, shape=(HEAD_DIM, N_CTX), strides=(1, stride_kn),
+        offsets=(0, 0), block_shape=(HEAD_DIM, BLOCK_N), order=(0, 1))
+    V_block_ptr = tl.make_block_ptr(
+        base=v_base, shape=(N_CTX, HEAD_DIM), strides=(stride_vn, 1),
+        offsets=(0, 0), block_shape=(BLOCK_N, HEAD_DIM), order=(1, 0))
+    O_block_ptr = tl.make_block_ptr(
+        base=o_base, shape=(N_CTX, HEAD_DIM), strides=(stride_om, 1),
+        offsets=(start_m * BLOCK_M, 0), block_shape=(BLOCK_M, HEAD_DIM),
+        order=(1, 0))
+
+    offs_m = start_m * BLOCK_M + tl.arange(0, BLOCK_M)
+    offs_n = tl.arange(0, BLOCK_N)
+
+    m_i = tl.zeros([BLOCK_M], dtype=tl.float32) - float("inf")
+    l_i = tl.zeros([BLOCK_M], dtype=tl.float32)
+    acc = tl.zeros([BLOCK_M, HEAD_DIM], dtype=tl.float32)
+
+    qk_scale = sm_scale * 1.4426950408889634  # fold log2(e) for exp2
+
+    if EVEN_M:
+        q = tl.load(Q_block_ptr)
+    else:
+        q = tl.load(Q_block_ptr, boundary_check=(0,), padding_option="zero")
+
+    # off-diagonal (fully unmasked) key blocks
+    acc, l_i, m_i = _attn_fwd_inner(acc, l_i, m_i, q, K_block_ptr, V_block_ptr,
+                                    start_m, qk_scale, N_CTX, offs_m, offs_n,
+                                    BLOCK_M, BLOCK_N, HEAD_DIM, 1, EVEN_N,
+                                    PIPELINE)
+    # diagonal block (elementwise causal mask)
+    acc, l_i, m_i = _attn_fwd_inner(acc, l_i, m_i, q, K_block_ptr, V_block_ptr,
+                                    start_m, qk_scale, N_CTX, offs_m, offs_n,
+                                    BLOCK_M, BLOCK_N, HEAD_DIM, 2, EVEN_N,
+                                    0)
+
+    # ---- normalize and store --------------------------------------------
+    l_safe = tl.where(l_i == 0.0, 1.0, l_i)
+    acc = acc / l_safe[:, None]
+    out = acc.to(Out.dtype.element_ty)
+    if EVEN_M:
+        tl.store(O_block_ptr, out)
+    else:
+        tl.store(O_block_ptr, out, boundary_check=(0,))
+
+
+# Isolated single-knob A/B configurations around the proven
+# BLOCK_M=128 / BLOCK_N=64 / num_warps=8 anchor.
+_CONFIGS = [
+    # anchor (known good)
+    triton.Config({"BLOCK_M": 128, "BLOCK_N": 64, "PIPELINE": 0},
+                  num_warps=8, num_stages=3),
+    # only knob changed: compute pipelining on
+    triton.Config({"BLOCK_M": 128, "BLOCK_N": 64, "PIPELINE": 1},
+                  num_warps=8, num_stages=3),
+    # compute pipelining + one fewer load stage (register relief)
+    triton.Config({"BLOCK_M": 128, "BLOCK_N": 64, "PIPELINE": 1},
+                  num_warps=8, num_stages=2),
+]
+
+_attn_fwd = triton.autotune(configs=_CONFIGS, key=["N_CTX"])(_attn_fwd_kernel)
+
+# (BLOCK_M, BLOCK_N, PIPELINE, num_warps, num_stages) fallbacks if autotuning
+# cannot run (e.g. a config exceeds device resources).
+_FALLBACKS = [
+    (128, 64, 0, 8, 3),
+    (128, 64, 0, 8, 2),
+    (64, 64, 0, 4, 2),
+]
+
+
+def kernel_function(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor,
+                    sm_scale: float | None = None) -> torch.Tensor:
+    """Causal scaled-dot-product attention, fully fused in one Triton kernel.
+
+    Args:
+        q, k, v: [Z, H, N_CTX, HEAD_DIM] CUDA tensors (fp16/bf16/fp32),
+                 last dimension contiguous.
+        sm_scale: optional softmax scale (defaults to 1/sqrt(HEAD_DIM)).
+
+    Returns:
+        Output tensor with the same shape/dtype as `q`.
+    """
+    if not (q.is_cuda and k.is_cuda and v.is_cuda):
+        raise ValueError("q, k, v must be CUDA tensors")
+    if q.dim() != 4 or k.dim() != 4 or v.dim() != 4:
+        raise ValueError("q, k, v must be 4-D [Z, H, N_CTX, HEAD_DIM]")
+    if not (q.dtype == k.dtype == v.dtype):
+        raise ValueError("q, k, v must share the same dtype")
+    if k.shape != q.shape or v.shape != q.shape:
+        raise ValueError("this kernel expects matching q/k/v shapes (self-attention)")
+    if not (q.stride(-1) == 1 and k.stride(-1) == 1 and v.stride(-1) == 1):
+        raise ValueError("head dimension must be contiguous")
+
+    Z, H, N_CTX, HEAD_DIM = q.shape
+    if HEAD_DIM not in (16, 32, 64, 128, 256):
+        raise ValueError(f"unsupported HEAD_DIM {HEAD_DIM}")
+
+    if sm_scale is None:
+        sm_scale = float(HEAD_DIM) ** -0.5
+
+    out = torch.empty_like(q)
+
+    # All autotuned configs use BLOCK_M = 128 and BLOCK_N dividing 128, so a
+    # single conservative evenness flag is valid for every candidate.
+    even = (N_CTX % 128 == 0)
+
+    args = (
+        q, k, v, out, sm_scale,
+        q.stride(0), q.stride(1), q.stride(2),
+        k.stride(0), k.stride(1), k.stride(2),
+        v.stride(0), v.stride(1), v.stride(2),
+        out.stride(0), out.stride(1), out.stride(2),
+        H, N_CTX,
+    )
+
+    major, _minor = torch.cuda.get_device_capability(q.device)
+    use_autotune = (major >= 8) and (HEAD_DIM <= 64) and (N_CTX >= 256)
+
+    if use_autotune:
+        grid = lambda META: (triton.cdiv(N_CTX, META["BLOCK_M"]), Z * H, 1)  # noqa: E731
+        try:
+            _attn_fwd[grid](
+                *args,
+                HEAD_DIM=HEAD_DIM,
+                EVEN_M=even, EVEN_N=even,
+            )
+            return out
+        except Exception:
+            pass
+
+    last_err = None
+    for BLOCK_M, BLOCK_N, PIPELINE, num_warps, num_stages in _FALLBACKS:
+        if HEAD_DIM > 64:
+            BLOCK_M = min(BLOCK_M, 64)
+            BLOCK_N = min(BLOCK_N, 64)
+        grid_f = (triton.cdiv(N_CTX, BLOCK_M), Z * H, 1)
+        try:
+            _attn_fwd_kernel[grid_f](
+                *args,
+                HEAD_DIM=HEAD_DIM,
+                BLOCK_M=BLOCK_M, BLOCK_N=BLOCK_N,
+                EVEN_M=(N_CTX % BLOCK_M == 0),
+                EVEN_N=(N_CTX % BLOCK_N == 0),
+                PIPELINE=PIPELINE,
+                num_warps=num_warps, num_stages=num_stages,
+            )
+            return out
+        except Exception as exc:  # try the next, cheaper configuration
+            last_err = exc
+
+    raise RuntimeError(f"failed to launch attention kernel: {last_err}")

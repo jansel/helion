@@ -1,0 +1,252 @@
+from __future__ import annotations
+
+import time
+
+import torch
+import triton
+import triton.language as tl
+
+
+# ---------------------------------------------------------------------------
+# device helpers
+# ---------------------------------------------------------------------------
+@triton.jit
+def _exp2_f16x2(x):
+    """Packed half2 exp2 on the MUFU pipe (2 results per SFU instruction)."""
+    return tl.inline_asm_elementwise(
+        "ex2.approx.f16x2 $0, $1;",
+        "=r,r",
+        [x],
+        dtype=tl.float16,
+        is_pure=True,
+        pack=2,
+    )
+
+
+@triton.jit
+def _add_combine(a, b):
+    return a + b
+
+
+@triton.jit
+def _exp2_probe(Out):
+    x = (tl.arange(0, 128).to(tl.float32) - 96.0) * 0.125
+    ref = tl.math.exp2(x)
+    got = _exp2_f16x2(x.to(tl.float16)).to(tl.float32)
+    d = tl.abs(got - ref) / ref
+    e = tl.max(d[None, :], 1)
+    tl.store(Out + tl.arange(0, 1), e)
+
+
+# ---------------------------------------------------------------------------
+# fused flash-attention forward (non-causal)
+# ---------------------------------------------------------------------------
+@triton.jit
+def _flash_attn_fwd(
+    Q, K, V, Out,
+    sm_scale,
+    stride_qz, stride_qh, stride_qm,
+    stride_kz, stride_kh, stride_kn,
+    stride_vz, stride_vh, stride_vn,
+    stride_oz, stride_oh, stride_om,
+    H, N_CTX,
+    HEAD_DIM: tl.constexpr,
+    BLOCK_M: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    EVEN_M: tl.constexpr,
+    EVEN_N: tl.constexpr,
+    FP16_EXP: tl.constexpr,
+):
+    start_m = tl.program_id(0)
+    off_hz = tl.program_id(1)
+    off_z = off_hz // H
+    off_h = off_hz % H
+
+    q_off = off_z.to(tl.int64) * stride_qz + off_h.to(tl.int64) * stride_qh
+    k_off = off_z.to(tl.int64) * stride_kz + off_h.to(tl.int64) * stride_kh
+    v_off = off_z.to(tl.int64) * stride_vz + off_h.to(tl.int64) * stride_vh
+    o_off = off_z.to(tl.int64) * stride_oz + off_h.to(tl.int64) * stride_oh
+
+    offs_m = start_m * BLOCK_M + tl.arange(0, BLOCK_M)
+    offs_n = tl.arange(0, BLOCK_N)
+    offs_d = tl.arange(0, HEAD_DIM)
+
+    # ---- load Q tile once, fold the softmax scale into it ------------------
+    q_ptrs = Q + q_off + offs_m[:, None] * stride_qm + offs_d[None, :]
+    if EVEN_M:
+        q = tl.load(q_ptrs)
+    else:
+        q = tl.load(q_ptrs, mask=offs_m[:, None] < N_CTX, other=0.0)
+
+    qk_scale = sm_scale * 1.4426950408889634
+    q = (q * qk_scale).to(Q.dtype.element_ty)
+
+    # K is streamed transposed ([HEAD_DIM, BLOCK_N], contiguous along d)
+    kT_ptrs = K + k_off + offs_d[:, None] + offs_n[None, :] * stride_kn
+    v_ptrs = V + v_off + offs_n[:, None] * stride_vn + offs_d[None, :]
+
+    m_i = tl.full([BLOCK_M], -float("inf"), dtype=tl.float32)
+    l_i = tl.zeros([BLOCK_M], dtype=tl.float32)
+    acc = tl.zeros([BLOCK_M, HEAD_DIM], dtype=tl.float32)
+
+    for start_n in tl.range(0, N_CTX, BLOCK_N):
+        if EVEN_N:
+            kT = tl.load(kT_ptrs)
+            v = tl.load(v_ptrs)
+        else:
+            nmask = (start_n + offs_n) < N_CTX
+            kT = tl.load(kT_ptrs, mask=nmask[None, :], other=0.0)
+            v = tl.load(v_ptrs, mask=nmask[:, None], other=0.0)
+
+        qk = tl.dot(q, kT)                       # fp32 accumulate, tensor cores
+        if not EVEN_N:
+            qk = tl.where(nmask[None, :], qk, -1.0e6)
+
+        m_ij = tl.maximum(m_i, tl.max(qk, 1))
+        alpha = tl.math.exp2(m_i - m_ij)
+        qk = qk - m_ij[:, None]
+
+        if FP16_EXP:
+            p = _exp2_f16x2(qk.to(tl.float16))
+            l_ij = tl.reduce(p, 1, _add_combine).to(tl.float32)
+        else:
+            pf = tl.math.exp2(qk)
+            l_ij = tl.sum(pf, 1)
+            p = pf.to(V.dtype.element_ty)
+
+        acc = acc * alpha[:, None]
+        acc = tl.dot(p, v, acc)
+
+        l_i = l_i * alpha + l_ij
+        m_i = m_ij
+
+        kT_ptrs += BLOCK_N * stride_kn
+        v_ptrs += BLOCK_N * stride_vn
+
+    acc = acc / l_i[:, None]
+    o_ptrs = Out + o_off + offs_m[:, None] * stride_om + offs_d[None, :]
+    out = acc.to(Out.dtype.element_ty)
+    if EVEN_M:
+        tl.store(o_ptrs, out)
+    else:
+        tl.store(o_ptrs, out, mask=offs_m[:, None] < N_CTX)
+
+
+# ---------------------------------------------------------------------------
+# launch / tuning plumbing (no math, no PyTorch compute primitives)
+# ---------------------------------------------------------------------------
+_PROBE_OK = None
+_CFG_CACHE: dict = {}
+
+_CANDIDATES = (
+    (128, 128, 8, 3),
+    (128, 128, 8, 2),
+    (128, 64, 8, 3),
+    (128, 64, 4, 3),
+    (128, 64, 4, 4),
+    (64, 64, 4, 3),
+)
+
+
+def _fp16_exp_ok() -> bool:
+    global _PROBE_OK
+    if _PROBE_OK is None:
+        ok = False
+        try:
+            buf = torch.zeros(1, device="cuda", dtype=torch.float32)
+            _exp2_probe[(1,)](buf, num_warps=1)
+            ok = bool(buf.item() < 2.0e-2)
+        except Exception:
+            ok = False
+        _PROBE_OK = ok
+    return _PROBE_OK
+
+
+def _launch(q, k, v, out, sm_scale, Z, H, N, D, cfg, fp16_exp, grid_m):
+    BM, BN, nw, ns = cfg
+    _flash_attn_fwd[(grid_m, Z * H, 1)](
+        q, k, v, out,
+        sm_scale,
+        q.stride(0), q.stride(1), q.stride(2),
+        k.stride(0), k.stride(1), k.stride(2),
+        v.stride(0), v.stride(1), v.stride(2),
+        out.stride(0), out.stride(1), out.stride(2),
+        H, N,
+        HEAD_DIM=D,
+        BLOCK_M=BM,
+        BLOCK_N=BN,
+        EVEN_M=(N % BM == 0),
+        EVEN_N=(N % BN == 0),
+        FP16_EXP=fp16_exp,
+        num_warps=nw,
+        num_stages=ns,
+    )
+
+
+def _autotune(q, k, v, out, sm_scale, Z, H, N, D, fp16_exp):
+    n_prog = max(1, Z * H)
+    waves = max(1, (444 + n_prog - 1) // n_prog)
+    best_cfg, best_score = None, None
+    for cfg in _CANDIDATES:
+        BM, BN = cfg[0], cfg[1]
+        if BM > N or BN > N:
+            continue
+        gm = max(1, min(triton.cdiv(N, BM), waves))
+        try:
+            _launch(q, k, v, out, sm_scale, Z, H, N, D, cfg, fp16_exp, gm)
+            torch.cuda.synchronize()
+            t0 = time.perf_counter()
+            for _ in range(2):
+                _launch(q, k, v, out, sm_scale, Z, H, N, D, cfg, fp16_exp, gm)
+            torch.cuda.synchronize()
+            score = (time.perf_counter() - t0) / float(gm * BM)
+        except Exception:
+            continue
+        if best_score is None or score < best_score:
+            best_score, best_cfg = score, cfg
+    if best_cfg is None:
+        best_cfg = (64, 64, 4, 2)
+    return best_cfg
+
+
+def kernel_function(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor,
+                    sm_scale: float | None = None) -> torch.Tensor:
+    if not (q.is_cuda and k.is_cuda and v.is_cuda):
+        raise ValueError("q, k, v must be CUDA tensors")
+    if q.dim() != 4 or k.dim() != 4 or v.dim() != 4:
+        raise ValueError("q, k, v must be 4-D [B, H, N, D] tensors")
+    if not (q.dtype == k.dtype == v.dtype):
+        raise ValueError("q, k, v must share a dtype")
+    if q.dtype not in (torch.float16, torch.bfloat16, torch.float32):
+        raise ValueError(f"unsupported dtype {q.dtype}")
+
+    Z, H, N_CTX, HEAD_DIM = q.shape
+    if k.shape != (Z, H, N_CTX, HEAD_DIM) or v.shape != (Z, H, N_CTX, HEAD_DIM):
+        raise ValueError("q, k, v must have identical shapes")
+    if HEAD_DIM & (HEAD_DIM - 1) != 0 or HEAD_DIM < 16:
+        raise ValueError("head_dim must be a power of two >= 16")
+
+    # only reshape if the innermost dimension is not unit-stride
+    if q.stride(-1) != 1:
+        q = q.contiguous()
+    if k.stride(-1) != 1:
+        k = k.contiguous()
+    if v.stride(-1) != 1:
+        v = v.contiguous()
+
+    if sm_scale is None:
+        sm_scale = float(HEAD_DIM) ** -0.5
+
+    out = torch.empty_like(q)
+
+    fp16_exp = (q.dtype == torch.float16) and _fp16_exp_ok()
+
+    key = (Z, H, N_CTX, HEAD_DIM, q.dtype, fp16_exp)
+    cfg = _CFG_CACHE.get(key)
+    if cfg is None:
+        cfg = _autotune(q, k, v, out, sm_scale, Z, H, N_CTX, HEAD_DIM, fp16_exp)
+        _CFG_CACHE[key] = cfg
+
+    _launch(q, k, v, out, sm_scale, Z, H, N_CTX, HEAD_DIM, cfg, fp16_exp,
+            triton.cdiv(N_CTX, cfg[0]))
+    return out

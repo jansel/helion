@@ -1,0 +1,75 @@
+# Optimized by KernelAgent-Oink(https://github.com/meta-pytorch/KernelAgent)
+import torch
+import cutlass
+import cutlass.cute as cute
+import cutlass.pipeline as pipeline
+import cutlass.utils as utils
+import cutlass.utils.blackwell_helpers as bh
+from cutlass.cute.nvgpu import tcgen05
+from cutlass.cute.runtime import from_dlpack
+from cuda.bindings import driver as cuda
+F16,F32=cutlass.Float16,cutlass.Float32
+M,N,D,S=128,128,64,65536
+QI,QT=(128,128,16),(128,128,64);VI,VT=(128,64,16),(128,64,128)
+@cute.struct
+class SS:
+ m:cute.struct.MemRange[cutlass.Int64,2]
+ h:cutlass.Int32
+@cute.kernel
+def ker(q:cute.Tensor,k:cute.Tensor,v:cute.Tensor,o:cute.Tensor,mq:cute.TiledMma,mp:cute.TiledMma,ql:cute.ComposedLayout,kl:cute.ComposedLayout,pl:cute.ComposedLayout,vl:cute.ComposedLayout):
+ t,_,_=cute.arch.thread_idx();w=cute.arch.make_warp_uniform(cute.arch.warp_idx());qb,bh0,_=cute.arch.block_idx();b,hd,q0=bh0//32,bh0%32,qb*M;r=t%128;p=t//128
+ sm=utils.SmemAllocator();ss=sm.allocate(SS);Q=sm.allocate_tensor(F16,ql.outer,byte_alignment=128,swizzle=ql.inner);K=sm.allocate_tensor(F16,kl.outer,byte_alignment=128,swizzle=kl.inner);P=sm.allocate_tensor(F16,pl.outer,byte_alignment=128,swizzle=pl.inner);V=sm.allocate_tensor(F16,vl.outer,byte_alignment=128,swizzle=vl.inner);Sd=sm.allocate_tensor(F16,cute.make_layout((M,N),stride=(1,M)),byte_alignment=128);R=sm.allocate_tensor(F32,cute.make_layout(512),byte_alignment=128);X=sm.allocate_tensor(F32,cute.make_layout(256),byte_alignment=128)
+ pr,co=pipeline.PipelineUmmaAsync.create(num_stages=1,producer_group=pipeline.CooperativeGroup(pipeline.Agent.Thread),consumer_group=pipeline.CooperativeGroup(pipeline.Agent.Thread,512),barrier_storage=ss.m.data_ptr()).make_participants();ba=pipeline.NamedBarrier(barrier_id=1,num_threads=512);tm=utils.TmemAllocator(ss.h,barrier_for_retrieve=ba);tm.allocate(256);tm.wait_for_alloc();tp=tm.retrieve_ptr(F32)
+ rq=mq.make_fragment_A(Q);rk=mq.make_fragment_B(K);z=mq.make_fragment_C(mq.partition_shape_C(QT[:2]));ts=cute.make_tensor(tp,z.layout);cs=mq.get_slice(0).partition_C(Sd);ep=((cute.size(ts,mode=[0,0]),cute.size(ts,mode=[0,1])//4),);tse=cute.zipped_divide(ts,ep);cse=cute.zipped_divide(cs,ep);cps=tcgen05.make_tmem_copy(cute.make_copy_atom(tcgen05.Ld32x32bOp(tcgen05.Repetition.x32),F32),tse[None,0]);th=cps.get_slice(r);srcs=th.partition_S(tse);dsts=th.partition_D(cse);xf=cute.make_rmem_tensor(dsts[None,None,0].shape,F32);xu=cute.filter_zeros(xf)
+ rp=mp.make_fragment_A(P);rv=mp.make_fragment_B(V);z=mp.make_fragment_C(mp.partition_shape_C(VT[:2]));tv=cute.make_tensor(tp,z.layout);go=cute.make_tensor(o.iterator+(bh0*S+q0)*D,cute.make_layout((M,D),stride=(D,1)));cO=mp.get_slice(0).partition_C(go);ep=((cute.size(tv,mode=[0,0]),cute.size(tv,mode=[0,1])//4),);tve=cute.zipped_divide(tv,ep);coe=cute.zipped_divide(cO,ep);cpv=tcgen05.make_tmem_copy(cute.make_copy_atom(tcgen05.Ld32x32bOp(tcgen05.Repetition.x16),F32),tve[None,0]);th=cpv.get_slice(r);srcv=th.partition_S(tve);dsto=th.partition_D(coe);xv=cute.make_rmem_tensor(dsto[None,None,0].shape,F32);xo=cute.make_rmem_tensor(dsto[None,None,0].shape,F32);xho=cute.make_rmem_tensor(dsto[None,None,0].shape,F16);xo.fill(0.0)
+ for i in cutlass.range(16,unroll=8):
+  z0=t+i*512;rr,dd=z0//D,z0%D;Q[((rr,dd%16),0,dd//16,0)]=q[(b,hd,q0+rr,dd)]
+ cute.arch.sync_threads();rm,rs=F32(-1e30),F32(0.0);sl2=F32(0.18033688011112042)
+ for kb in cutlass.range(qb+1):
+  k0=kb*N
+  for i in cutlass.range(16,unroll=8):
+   z0=t+i*512;rr,dd=z0//D,z0%D;K[((rr,dd%16),0,dd//16,0)]=k[(b,hd,k0+rr,dd)];V[((dd,rr%16),0,rr//16,0)]=v[(b,hd,k0+rr,dd)]
+  cute.arch.sync_threads()
+  if w==0:
+   e=pr.acquire_and_advance();mq.set(tcgen05.Field.ACCUMULATE,False)
+   for kk in cutlass.range_constexpr(cute.size(rq,mode=[2])):
+    c=(None,None,kk,0);cute.gemm(mq,ts,rq[c],rk[c],ts);mq.set(tcgen05.Field.ACCUMULATE,True)
+   e.commit()
+  f=co.wait_and_advance();cute.copy(cps,srcs[None,None,p],xf);mx=F32(-1e30);c0=p*32
+  for j in cutlass.range(32,unroll=32):
+   c=c0+j;x=xu[j]
+   if kb==qb and c>r:x=F32(-1e30)
+   if x>mx:mx=x
+  R[t]=mx;cute.arch.sync_threads()
+  if p==0:
+   mx=R[r]
+   if R[r+128]>mx:mx=R[r+128]
+   if R[r+256]>mx:mx=R[r+256]
+   if R[r+384]>mx:mx=R[r+384]
+   nm=rm
+   if mx>nm:nm=mx
+   X[r]=nm;X[r+128]=cute.arch.exp2((rm-nm)*sl2)
+  cute.arch.sync_threads();nm=X[r];a=X[r+128];su=F32(0.0)
+  for j in cutlass.range(32,unroll=32):
+   c=c0+j;y=cute.arch.exp2((xu[j]-nm)*sl2)
+   if kb==qb and c>r:y=F32(0.0)
+   su+=y;P[((r,c%16),0,c//16,0)]=F16(y)
+  f.release();R[t]=su;cute.arch.sync_threads()
+  if p==0:rs=rs*a+R[r]+R[r+128]+R[r+256]+R[r+384];rm=nm
+  if w==0:
+   e=pr.acquire_and_advance();mp.set(tcgen05.Field.ACCUMULATE,False)
+   for kk in cutlass.range_constexpr(cute.size(rp,mode=[2])):
+    c=(None,None,kk,0);cute.gemm(mp,tv,rp[c],rv[c],tv);mp.set(tcgen05.Field.ACCUMULATE,True)
+   e.commit()
+  f=co.wait_and_advance();cute.copy(cpv,srcv[None,None,p],xv)
+  if a==F32(1.0):xo.store(xo.load()+xv.load())
+  else:xo.store(xo.load()*a+xv.load())
+  f.release()
+ if p==0:X[r]=F32(1.0)/rs
+ cute.arch.sync_threads();xho.store((xo.load()*X[r]).to(F16));cute.autovec_copy(xho,dsto[None,None,p])
+ tm.relinquish_alloc_permit();pipeline.sync(barrier_id=1);tm.free(tp)
+@cute.jit
+def launch(q:cute.Tensor,k:cute.Tensor,v:cute.Tensor,o:cute.Tensor,s:cuda.CUstream):
+ mq=cute.make_tiled_mma(tcgen05.MmaF16BF16Op(F16,F32,QI,tcgen05.CtaGroup.ONE,tcgen05.OperandSource.SMEM,tcgen05.OperandMajorMode.K,tcgen05.OperandMajorMode.K));mp=cute.make_tiled_mma(tcgen05.MmaF16BF16Op(F16,F32,VI,tcgen05.CtaGroup.ONE,tcgen05.OperandSource.SMEM,tcgen05.OperandMajorMode.K,tcgen05.OperandMajorMode.K));ql=bh.make_smem_layout_a(mq,QT,F16,1);kl=bh.make_smem_layout_b(mq,QT,F16,1);pl=bh.make_smem_layout_a(mp,VT,F16,1);vl=bh.make_smem_layout_b(mp,VT,F16,1);ker(q,k,v,o,mq,mp,ql,kl,pl,vl).launch(grid=(512,64,1),block=(512,1,1),stream=s)
+def kernel_function(q,k,v):
+ o=torch.empty_like(q);s=cuda.CUstream(torch.cuda.current_stream().cuda_stream);launch(from_dlpack(q,assumed_align=16),from_dlpack(k,assumed_align=16),from_dlpack(v,assumed_align=16),from_dlpack(o,assumed_align=16),s);return o

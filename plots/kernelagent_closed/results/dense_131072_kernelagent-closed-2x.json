@@ -1,0 +1,58 @@
+{
+  "accuracy": "PASS",
+  "benchmark_timer": "event",
+  "best_ms": 4411.318359375,
+  "best_tflops": 63.807450240461826,
+  "config": {
+    "budget_label": "2x",
+    "budget_seconds": 2773.4,
+    "elapsed_seconds": 2773.51380109787,
+    "selection": {
+      "candidate_id": 12,
+      "hypothesis": "Exact 128-column TMEM footprint may further reduce resource pressure.",
+      "median_ms": 4409.49462890625,
+      "mutation_family": "tmem-footprint",
+      "source_sha256": "074f22a17bd02069240d9a524920f6e2bcf870e8879ae0aa411d499e8c0ffffe",
+      "tflops": 63.83384047356789
+    },
+    "source_sha256": "074f22a17bd02069240d9a524920f6e2bcf870e8879ae0aa411d499e8c0ffffe"
+  },
+  "flop_model": "softmax_attention_forward",
+  "gpu": "NVIDIA B200",
+  "impl": "kernelagent-closed-2x",
+  "mean_ms": 4412.736219618056,
+  "median_ms": 4412.859375,
+  "median_tflops": 63.78516802626551,
+  "mom_median_ms": 4412.859375,
+  "mom_median_tflops": 63.78516802626551,
+  "notes": [
+    "KernelAgent Closed wall-clock tuning budget 2773.4s (2x); elapsed 2773.5s.",
+    "Selected source sha256 074f22a17bd02069240d9a524920f6e2bcf870e8879ae0aa411d499e8c0ffffe; candidate 12; internal search time 4409.49462890625 ms.",
+    "GPT-5.6 had only a controlled CuTeDSL campaign MCP; no shell, web, arbitrary file, subagent, Helion, or FlashAttention access. Generated kernels ran in a network-isolated sandbox."
+  ],
+  "physical_gpu": "7",
+  "power_cap_w": 750,
+  "runs_ms": [
+    4412.23291015625,
+    4413.16748046875,
+    4412.859375,
+    4411.318359375,
+    4413.52490234375,
+    4412.033203125,
+    4413.64892578125,
+    4412.39453125,
+    4413.4462890625
+  ],
+  "shape": {
+    "biased": 0,
+    "causal": 0,
+    "dtype": "float16",
+    "h": 32,
+    "head_dim": 64,
+    "seq_len": 131072,
+    "z": 2
+  },
+  "std_ms": 0.7933344172756153,
+  "version": "KernelAgent v3-20260730; GPT-5.6; CuTe 4.5.1",
+  "version_label": "KernelAgent v3-20260730 / GPT-5.6 / CuTe 4.5.1"
+}

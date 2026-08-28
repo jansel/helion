@@ -1,0 +1,5 @@
+version: 1
+agent:
+  name: controlled-cutedsl-attention-optimizer
+  system_prompt_path: ./system.md
+  tools: []

@@ -1,0 +1,84 @@
+# Optimized by KernelAgent-Oink(https://github.com/meta-pytorch/KernelAgent)
+import torch
+import cutlass
+import cutlass.cute as cute
+import cutlass.utils as utils
+import cutlass.pipeline as pipeline
+import cutlass.utils.blackwell_helpers as sm100_utils
+from cutlass.cute.nvgpu import tcgen05
+from cutlass.cute.runtime import from_dlpack
+F16,F32=cutlass.Float16,cutlass.Float32
+S,H,D,BH,M,N,T,CUT=131072,32,64,64,128,128,128,32
+RS,L2=F32(2048.0),F32(1.4426950408889634)
+@cute.struct
+class Storage:
+    bar:cute.struct.MemRange[cutlass.Int64,2]
+    hold:cutlass.Int32
+@cute.kernel
+def attn(q:cute.Tensor,k:cute.Tensor,v:cute.Tensor,o:cute.Tensor,mq:cute.TiledMma,mp:cute.TiledMma,lq:cute.ComposedLayout,lk:cute.ComposedLayout,lp:cute.ComposedLayout,lv:cute.ComposedLayout):
+    tid,_,_=cute.arch.thread_idx(); qt,bh,_=cute.arch.block_idx(); b,h,q0=bh//H,bh%H,qt*M
+    sm=utils.SmemAllocator(); st=sm.allocate(Storage)
+    Q=sm.allocate_tensor(F16,lq.outer,byte_alignment=128,swizzle=lq.inner); K=sm.allocate_tensor(F16,lk.outer,byte_alignment=128,swizzle=lk.inner); P=sm.allocate_tensor(F16,lp.outer,byte_alignment=128,swizzle=lp.inner); V=sm.allocate_tensor(F16,lv.outer,byte_alignment=128,swizzle=lv.inner)
+    X=sm.allocate_tensor(F32,cute.make_layout((M,N),stride=(N+1,1)),byte_alignment=128)
+    O=sm.allocate_tensor(F32,cute.make_layout((M,D),stride=(D+1,1)),byte_alignment=128)
+    Z=sm.allocate_tensor(F32,cute.make_layout((M,D),stride=(D+1,1)),byte_alignment=128)
+    for it in cutlass.range_constexpr((M*D)//T):
+        ix=tid+it*T; qr=ix//D; dd=ix%D; Q[(qr,dd%16),0,dd//16,0]=q[b,h,q0+qr,dd]*F16(.125); O[qr,dd]=F32(0.0)
+    cute.arch.barrier(); nb=pipeline.NamedBarrier(barrier_id=1,num_threads=T); tm=utils.TmemAllocator(st.hold,barrier_for_retrieve=nb); tm.allocate(256); tm.wait_for_alloc(); ptr=tm.retrieve_ptr(F32)
+    tX=cute.make_tensor(ptr,mq.make_fragment_C(mq.partition_shape_C((M,N))).layout); tZ=cute.make_tensor(ptr,mp.make_fragment_C(mp.partition_shape_C((M,D))).layout)
+    rQ,rK=mq.make_fragment_A(Q),mq.make_fragment_B(K); rP,rV=mp.make_fragment_A(P),mp.make_fragment_B(V); cX,cZ=mq.get_slice(0).partition_C(X),mp.get_slice(0).partition_C(Z)
+    ex=((cute.size(tX,mode=[0,0]),cute.size(tX,mode=[0,1])//2),); tx,cx=cute.zipped_divide(tX,ex),cute.zipped_divide(cX,ex)
+    atom=cute.make_copy_atom(tcgen05.Ld32x32bOp(tcgen05.Repetition.x64),F32); lx=tcgen05.make_tmem_copy(atom,tx[None,0]); thx=lx.get_slice(tid); sx,dx=thx.partition_S(tx),thx.partition_D(cx); rx=cute.make_rmem_tensor(dx[None,None,0].shape,F32)
+    ez=((cute.size(tZ,mode=[0,0]),cute.size(tZ,mode=[0,1])),); tz,cz=cute.zipped_divide(tZ,ez),cute.zipped_divide(cZ,ez); lz=tcgen05.make_tmem_copy(atom,tz[None,0]); thz=lz.get_slice(tid); sz,dz=thz.partition_S(tz),thz.partition_D(cz); rz=cute.make_rmem_tensor(dz[None,None,0].shape,F32)
+    prod,cons=pipeline.PipelineUmmaAsync.create(num_stages=1,producer_group=pipeline.CooperativeGroup(pipeline.Agent.Thread),consumer_group=pipeline.CooperativeGroup(pipeline.Agent.Thread,T),barrier_storage=st.bar.data_ptr()).make_participants(); rm,rl=F32(-1e30),F32(0.0); warp=cute.arch.make_warp_uniform(cute.arch.warp_idx())
+    for kt in cutlass.range(qt+1):
+        k0=kt*N
+        for it in cutlass.range_constexpr((N*D)//T):
+            ix=tid+it*T; kr=ix//D; dd=ix%D; K[(kr,dd%16),0,dd//16,0]=k[b,h,k0+kr,dd]; V[(dd,kr%16),0,kr//16,0]=v[b,h,k0+kr,dd]
+        cute.arch.barrier()
+        if warp==0:
+            e=prod.acquire_and_advance(); mq.set(tcgen05.Field.ACCUMULATE,False)
+            for z in cutlass.range_constexpr(4): cute.gemm(mq,tX,rQ[None,None,z,0],rK[None,None,z,0],tX); mq.set(tcgen05.Field.ACCUMULATE,True)
+            e.commit()
+        f=cons.wait_and_advance()
+        for z in cutlass.range_constexpr(2): cute.copy(lx,sx[None,None,z],rx); cute.autovec_copy(rx,dx[None,None,z])
+        f.release(); cute.arch.barrier(); mm=F32(-1e30)
+        for j in cutlass.range_constexpr(N):
+            x=X[tid,j]
+            if kt!=qt or j<=tid: mm=cute.arch.fmax(mm,x)
+        nm=cute.arch.fmax(rm,mm); a=cute.math.exp2((rm-nm)*L2); sl=F32(0.0)
+        for j in cutlass.range_constexpr(N):
+            x=X[tid,j]; p=F32(0.0)
+            if kt!=qt or j<=tid: p=cute.math.exp2((x-nm)*L2)
+            sl=sl+p; P[(tid,j%16),0,j//16,0]=p.to(F16)
+        cute.arch.barrier()
+        if warp==0:
+            e2=prod.acquire_and_advance(); mp.set(tcgen05.Field.ACCUMULATE,False)
+            for z in cutlass.range_constexpr(8): cute.gemm(mp,tZ,rP[None,None,z,0],rV[None,None,z,0],tZ); mp.set(tcgen05.Field.ACCUMULATE,True)
+            e2.commit()
+        f2=cons.wait_and_advance(); cute.copy(lz,sz[None,None,0],rz); cute.autovec_copy(rz,dz[None,None,0]); f2.release(); cute.arch.barrier()
+        for d in cutlass.range_constexpr(D): O[tid,d]=a*O[tid,d]+Z[tid,d]
+        if qt<CUT:
+            cute.arch.barrier()
+            for j in cutlass.range_constexpr(N):
+                x=X[tid,j]; p=F32(0.0)
+                if kt!=qt or j<=tid: p=cute.math.exp2((x-nm)*L2)
+                ph=p.to(F16); P[(tid,j%16),0,j//16,0]=((p-ph.to(F32))*RS).to(F16)
+            cute.arch.barrier()
+            if warp==0:
+                e3=prod.acquire_and_advance(); mp.set(tcgen05.Field.ACCUMULATE,False)
+                for z in cutlass.range_constexpr(8): cute.gemm(mp,tZ,rP[None,None,z,0],rV[None,None,z,0],tZ); mp.set(tcgen05.Field.ACCUMULATE,True)
+                e3.commit()
+            f3=cons.wait_and_advance(); cute.copy(lz,sz[None,None,0],rz); cute.autovec_copy(rz,dz[None,None,0]); f3.release(); cute.arch.barrier()
+            for d in cutlass.range_constexpr(D): O[tid,d]=O[tid,d]+Z[tid,d]/RS
+        rl,rm=a*rl+sl,nm; cute.arch.barrier()
+    iv=F32(1.0)/rl
+    for d in cutlass.range_constexpr(D): o[b,h,q0+tid,d]=(O[tid,d]*iv).to(F16)
+    tm.relinquish_alloc_permit(); pipeline.sync(barrier_id=1); tm.free(ptr)
+@cute.jit
+def launch(q:cute.Tensor,k:cute.Tensor,v:cute.Tensor,o:cute.Tensor):
+    aq=tcgen05.MmaF16BF16Op(F16,F32,(M,N,16),tcgen05.CtaGroup.ONE,tcgen05.OperandSource.SMEM,tcgen05.OperandMajorMode.K,tcgen05.OperandMajorMode.K); ap=tcgen05.MmaF16BF16Op(F16,F32,(M,D,16),tcgen05.CtaGroup.ONE,tcgen05.OperandSource.SMEM,tcgen05.OperandMajorMode.K,tcgen05.OperandMajorMode.MN); mq,mp=cute.make_tiled_mma(aq),cute.make_tiled_mma(ap)
+    lq=sm100_utils.make_smem_layout_a(mq,(M,N,D),F16,1); lk=sm100_utils.make_smem_layout_b(mq,(M,N,D),F16,1); lp=sm100_utils.make_smem_layout_a(mp,(M,D,N),F16,1); lv=sm100_utils.make_smem_layout_b(mp,(M,D,N),F16,1)
+    attn(q,k,v,o,mq,mp,lq,lk,lp,lv).launch(grid=(S//M,BH,1),block=(T,1,1))
+def kernel_function(q,k,v):
+    o=torch.empty_like(q); launch(from_dlpack(q,assumed_align=32),from_dlpack(k,assumed_align=32),from_dlpack(v,assumed_align=32),from_dlpack(o,assumed_align=32)); return o

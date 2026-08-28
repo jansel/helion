@@ -1,0 +1,230 @@
+from __future__ import annotations
+
+import argparse
+import concurrent.futures
+import contextlib
+import hashlib
+import json
+import os
+from pathlib import Path
+import signal
+import subprocess
+import threading
+import time
+from typing import Any
+
+SHAPES = (
+    ("dense", 32768, 7),
+    ("dense", 65536, 7),
+    ("dense", 131072, 7),
+    ("dense", 262144, 7),
+    ("causal", 65536, 6),
+    ("causal", 131072, 6),
+    ("causal", 262144, 6),
+    ("causal", 524288, 6),
+)
+RESULT_PREFIX = "KERNELAGENT_RESULT="
+_ACTIVE_PROCESS_GROUPS: set[int] = set()
+_ACTIVE_PROCESS_GROUPS_LOCK = threading.Lock()
+
+
+def _terminate_process_group(process: subprocess.Popen[str]) -> None:
+    if process.poll() is not None:
+        return
+    with contextlib.suppress(ProcessLookupError):
+        os.killpg(process.pid, signal.SIGTERM)
+    try:
+        process.wait(timeout=1)
+    except subprocess.TimeoutExpired:
+        with contextlib.suppress(ProcessLookupError):
+            os.killpg(process.pid, signal.SIGKILL)
+        with contextlib.suppress(subprocess.TimeoutExpired):
+            process.wait(timeout=1)
+
+
+def _terminate_active_process_groups() -> None:
+    with _ACTIVE_PROCESS_GROUPS_LOCK:
+        process_groups = tuple(_ACTIVE_PROCESS_GROUPS)
+    for process_group in process_groups:
+        with contextlib.suppress(ProcessLookupError):
+            os.killpg(process_group, signal.SIGTERM)
+    deadline = time.monotonic() + 1.5
+    alive = set(process_groups)
+    while alive and time.monotonic() < deadline:
+        for process_group in tuple(alive):
+            try:
+                os.killpg(process_group, 0)
+            except ProcessLookupError:
+                alive.discard(process_group)
+        if alive:
+            time.sleep(0.05)
+    for process_group in alive:
+        with contextlib.suppress(ProcessLookupError):
+            os.killpg(process_group, signal.SIGKILL)
+
+
+def _handle_signal(signum: int, _frame: object) -> None:
+    signal.signal(signum, signal.SIG_DFL)
+    _terminate_active_process_groups()
+    raise SystemExit(128 + signum)
+
+
+def _validation_timeout(seq_len: int) -> int:
+    if seq_len >= 524288:
+        return 3600
+    if seq_len >= 262144:
+        return 1800
+    return 900
+
+
+def _sha256(path: Path) -> str:
+    return hashlib.sha256(path.read_bytes()).hexdigest()
+
+
+def _write_json(path: Path, payload: object) -> None:
+    temporary = path.with_suffix(path.suffix + ".tmp")
+    temporary.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n")
+    temporary.replace(path)
+
+
+def _parse_result(stdout: str) -> dict[str, Any]:
+    for line in reversed(stdout.splitlines()):
+        if line.startswith(RESULT_PREFIX):
+            return json.loads(line.removeprefix(RESULT_PREFIX))
+    raise RuntimeError(f"evaluator produced no result: {stdout[-2000:]!r}")
+
+
+def _run_validation(
+    run_root: Path,
+    setup_root: Path,
+    variant: str,
+    seq_len: int,
+    gpu: int,
+    budget_label: str,
+) -> tuple[str, int, dict[str, Any]]:
+    run_dir = run_root / f"{variant}_{seq_len}_{budget_label}"
+    source = run_dir / "selected_kernel.py.txt"
+    manifest_path = run_dir / "manifest.json"
+    if not manifest_path.is_file():
+        raise RuntimeError(f"incomplete selected run: {run_dir}")
+    manifest = json.loads(manifest_path.read_text())
+    if manifest.get("status") == "FAIL":
+        return variant, seq_len, {"status": "SKIP", "reason": "campaign failed"}
+    if not source.is_file():
+        raise RuntimeError(f"incomplete selected run: {run_dir}")
+
+    environment = os.environ.copy()
+    environment.update(
+        {
+            "KERNELAGENT_ALLOWED_RUN_ROOT": str(run_dir),
+            "KERNELAGENT_SETUP_ROOT": str(setup_root),
+            "KERNELAGENT_PHYSICAL_GPU": str(gpu),
+        }
+    )
+    command = [
+        str(setup_root / "sandbox_launcher.sh"),
+        str(setup_root / "evaluate_candidate.py.txt"),
+        "--source",
+        str(source),
+        "--seq-len",
+        str(seq_len),
+        "--causal",
+        str(int(variant == "causal")),
+        "--mode",
+        "validate",
+    ]
+    with _ACTIVE_PROCESS_GROUPS_LOCK:
+        process = subprocess.Popen(
+            command,
+            cwd=run_dir,
+            env=environment,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            start_new_session=True,
+        )
+        _ACTIVE_PROCESS_GROUPS.add(process.pid)
+    timeout = _validation_timeout(seq_len)
+    try:
+        stdout, stderr = process.communicate(timeout=timeout)
+    except subprocess.TimeoutExpired:
+        _terminate_process_group(process)
+        raise RuntimeError(
+            f"validation timed out after {timeout}s for {run_dir}"
+        ) from None
+    finally:
+        with _ACTIVE_PROCESS_GROUPS_LOCK:
+            _ACTIVE_PROCESS_GROUPS.discard(process.pid)
+    result = _parse_result(stdout)
+    if process.returncode != 0 or result.get("status") != "PASS":
+        raise RuntimeError(
+            f"validation failed for {run_dir}: exit={process.returncode}, "
+            f"result={result}, stderr={stderr[-4000:]}"
+        )
+
+    manifest["posthoc_correctness_validation"] = {
+        "evaluator_sha256": _sha256(setup_root / "evaluate_candidate.py.txt"),
+        "source_sha256": _sha256(source),
+        "standard_seed": 2026080106,
+        "stress_seed": 2026080107,
+        "atol": 5e-2,
+        "rtol": 2e-2,
+        **result,
+    }
+    _write_json(manifest_path, manifest)
+    return variant, seq_len, result
+
+
+def validate(args: argparse.Namespace) -> None:
+    run_root = args.run_root.resolve()
+    setup_root = Path(__file__).resolve().parent
+    all_streams = (
+        [shape for shape in SHAPES if shape[0] == "dense"],
+        [shape for shape in SHAPES if shape[0] == "causal"],
+    )
+    streams = [
+        stream
+        for stream in all_streams
+        if args.variant == "all" or stream[0][0] == args.variant
+    ]
+
+    def validate_stream(
+        shapes: list[tuple[str, int, int]],
+    ) -> list[tuple[str, int, dict[str, Any]]]:
+        return [
+            _run_validation(
+                run_root,
+                setup_root,
+                variant,
+                seq_len,
+                gpu,
+                args.budget_label,
+            )
+            for variant, seq_len, gpu in shapes
+        ]
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=2) as executor:
+        futures = [executor.submit(validate_stream, stream) for stream in streams]
+        results = [result for future in futures for result in future.result()]
+    for variant, seq_len, result in results:
+        if result["status"] == "SKIP":
+            print(f"SKIP {variant} {seq_len}: {result['reason']}")
+            continue
+        print(
+            f"PASS {variant} {seq_len}: max_abs={result['max_abs_error']:.6g}, "
+            f"stress_max_abs={result['stress_max_abs_error']:.6g}"
+        )
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--run-root", type=Path, required=True)
+    parser.add_argument("--variant", choices=("all", "dense", "causal"), default="all")
+    parser.add_argument("--budget-label", choices=("1x", "2x"), default="1x")
+    return parser.parse_args()
+
+
+if __name__ == "__main__":
+    signal.signal(signal.SIGINT, _handle_signal)
+    signal.signal(signal.SIGTERM, _handle_signal)
+    validate(parse_args())

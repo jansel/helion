@@ -1,0 +1,28 @@
+{
+  "accuracy": "FAIL",
+  "config": {
+    "budget_label": "1x",
+    "budget_seconds": 840.9,
+    "elapsed_seconds": 840.9
+  },
+  "error": "No candidate passed both full-output correctness cases in 1x.",
+  "flop_model": "softmax_attention_forward",
+  "gpu": "NVIDIA B200",
+  "impl": "kernelagent-closed-1x",
+  "notes": [
+    "The fresh 1x campaign exhausted its fixed wall-clock budget without a dual-case-correct candidate; no throughput is reported."
+  ],
+  "physical_gpu": "7",
+  "power_cap_w": 750,
+  "shape": {
+    "biased": 0,
+    "causal": 0,
+    "dtype": "float16",
+    "h": 32,
+    "head_dim": 64,
+    "seq_len": 65536,
+    "z": 2
+  },
+  "version": "KernelAgent v3-20260730; GPT-5.6; CuTe 4.5.1",
+  "version_label": "KernelAgent v3-20260730 / GPT-5.6 / CuTe 4.5.1"
+}

@@ -1,0 +1,58 @@
+{
+  "accuracy": "PASS",
+  "benchmark_timer": "event",
+  "best_ms": 4592.376953125,
+  "best_tflops": 245.16713639468918,
+  "config": {
+    "budget_label": "2x",
+    "budget_seconds": 7365.4,
+    "elapsed_seconds": 7365.513773918152,
+    "selection": {
+      "candidate_id": 24,
+      "hypothesis": "Delay next-K prefetch until PV0 completes so urgent V0 traffic does not contend with a noncritical 16 KiB K transfer; K still overlaps PV0 epilogue plus the complete second half.",
+      "median_ms": 4594.41552734375,
+      "mutation_family": "k-prefetch-priority",
+      "source_sha256": "2618f71cc88949def8424756521e5db19d6841e5bee2b920f2bd89647b748902",
+      "tflops": 245.05835402605828
+    },
+    "source_sha256": "2618f71cc88949def8424756521e5db19d6841e5bee2b920f2bd89647b748902"
+  },
+  "flop_model": "softmax_attention_forward",
+  "gpu": "NVIDIA B200",
+  "impl": "kernelagent-closed-2x",
+  "mean_ms": 4595.679958767361,
+  "median_ms": 4594.9931640625,
+  "median_tflops": 245.02754773354212,
+  "mom_median_ms": 4594.9931640625,
+  "mom_median_tflops": 245.02754773354212,
+  "notes": [
+    "KernelAgent Closed wall-clock tuning budget 7365.4s (2x); elapsed 7365.5s.",
+    "Selected source sha256 2618f71cc88949def8424756521e5db19d6841e5bee2b920f2bd89647b748902; candidate 24; internal search time 4594.41552734375 ms.",
+    "GPT-5.6 had only a controlled CuTeDSL campaign MCP; no shell, web, arbitrary file, subagent, Helion, or FlashAttention access. Generated kernels ran in a network-isolated sandbox."
+  ],
+  "physical_gpu": "7",
+  "power_cap_w": 750,
+  "runs_ms": [
+    4592.376953125,
+    4594.9931640625,
+    4596.01611328125,
+    4599.982421875,
+    4594.87109375,
+    4597.40478515625,
+    4594.70849609375,
+    4596.35595703125,
+    4594.41064453125
+  ],
+  "shape": {
+    "biased": 0,
+    "causal": 0,
+    "dtype": "float16",
+    "h": 32,
+    "head_dim": 64,
+    "seq_len": 262144,
+    "z": 2
+  },
+  "std_ms": 2.140294447821637,
+  "version": "KernelAgent v3-20260730; GPT-5.6; CuTe 4.5.1",
+  "version_label": "KernelAgent v3-20260730 / GPT-5.6 / CuTe 4.5.1"
+}

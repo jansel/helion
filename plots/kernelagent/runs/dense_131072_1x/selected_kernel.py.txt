@@ -1,0 +1,176 @@
+from __future__ import annotations
+
+import torch
+import triton
+import triton.language as tl
+
+
+# --------------------------------------------------------------------------- #
+# Triton kernel                                                               #
+# --------------------------------------------------------------------------- #
+@triton.jit
+def _attn_fwd(
+    Q, K, V, Out,                      # pointers (last dim is unit-stride)
+    qk_scale,                          # 1/sqrt(d) * log2(e)   (fp32 scalar)
+    stride_qz, stride_qh, stride_qm,
+    stride_kz, stride_kh, stride_kn,
+    stride_vz, stride_vh, stride_vn,
+    stride_oz, stride_oh, stride_om,
+    H, N_CTX,
+    HEAD_DIM: tl.constexpr,
+    BLOCK_M: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    EVEN_N: tl.constexpr,
+    EVEN_M: tl.constexpr,
+):
+    start_m = tl.program_id(0)
+    off_hz = tl.program_id(1)
+
+    # 64-bit base pointers (multi-GB tensors); tile-local offsets stay 32-bit.
+    off_z = (off_hz // H).to(tl.int64)
+    off_h = (off_hz % H).to(tl.int64)
+
+    q_base = Q + off_z * stride_qz + off_h * stride_qh
+    k_base = K + off_z * stride_kz + off_h * stride_kh
+    v_base = V + off_z * stride_vz + off_h * stride_vh
+    o_base = Out + off_z * stride_oz + off_h * stride_oh
+
+    offs_m = start_m * BLOCK_M + tl.arange(0, BLOCK_M)
+    offs_n = tl.arange(0, BLOCK_N)
+    offs_d = tl.arange(0, HEAD_DIM)
+
+    # ---------------- load Q tile (stays resident in registers) ------------- #
+    q_ptrs = q_base + offs_m[:, None] * stride_qm + offs_d[None, :]
+    if EVEN_M:
+        q = tl.load(q_ptrs)
+    else:
+        q = tl.load(q_ptrs, mask=offs_m[:, None] < N_CTX, other=0.0)
+
+    # ---------------- online-softmax state --------------------------------- #
+    # A large *finite* sentinel removes every -inf/NaN guard from the inner
+    # loop (exp2 of a hugely negative argument flushes to exactly 0.0).
+    NEG = -1.0e30
+    m_i = tl.full([BLOCK_M], NEG, dtype=tl.float32)      # running max (unscaled)
+    ms_i = m_i * qk_scale                                # running max (scaled)
+    l_i = tl.zeros([BLOCK_M], dtype=tl.float32)
+    acc = tl.zeros([BLOCK_M, HEAD_DIM], dtype=tl.float32)
+
+    k_ptrs = k_base + offs_n[None, :] * stride_kn + offs_d[:, None]   # [D, N]
+    v_ptrs = v_base + offs_n[:, None] * stride_vn + offs_d[None, :]   # [N, D]
+
+    # ---------------- stream over K / V ------------------------------------ #
+    for start_n in tl.range(0, N_CTX, BLOCK_N):
+        start_n = tl.multiple_of(start_n, BLOCK_N)
+
+        if EVEN_N:
+            k = tl.load(k_ptrs + start_n * stride_kn)
+        else:
+            n_idx = start_n + offs_n
+            k = tl.load(k_ptrs + start_n * stride_kn,
+                        mask=n_idx[None, :] < N_CTX, other=0.0)
+
+        # ---- S = Q @ K^T  (unscaled, fp32 accumulator, tensor cores) ------ #
+        qk = tl.dot(q, k)
+
+        if not EVEN_N:
+            qk = tl.where((start_n + offs_n)[None, :] < N_CTX, qk, NEG)
+
+        # ---- online softmax: the scale folds into a single FFMA per element #
+        m_new = tl.maximum(m_i, tl.max(qk, 1))
+        ms_new = m_new * qk_scale
+        p = tl.math.exp2(qk * qk_scale - ms_new[:, None])
+
+        alpha = tl.math.exp2(ms_i - ms_new)
+        l_i = l_i * alpha + tl.sum(p, 1)
+        acc = acc * alpha[:, None]
+
+        # ---- acc += P @ V ------------------------------------------------- #
+        if EVEN_N:
+            v = tl.load(v_ptrs + start_n * stride_vn)
+        else:
+            v = tl.load(v_ptrs + start_n * stride_vn,
+                        mask=(start_n + offs_n)[:, None] < N_CTX, other=0.0)
+
+        acc = tl.dot(p.to(v.dtype), v, acc)
+
+        m_i = m_new
+        ms_i = ms_new
+
+    # ---------------- epilogue: normalize + store -------------------------- #
+    acc = acc * (1.0 / l_i)[:, None]
+
+    o_ptrs = o_base + offs_m[:, None] * stride_om + offs_d[None, :]
+    if EVEN_M:
+        tl.store(o_ptrs, acc.to(Out.dtype.element_ty))
+    else:
+        tl.store(o_ptrs, acc.to(Out.dtype.element_ty), mask=offs_m[:, None] < N_CTX)
+
+
+# --------------------------------------------------------------------------- #
+# Python wrapper: validation / allocation / launch only (no math)             #
+# --------------------------------------------------------------------------- #
+def kernel_function(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor,
+                    sm_scale: float | None = None) -> torch.Tensor:
+    if not (q.is_cuda and k.is_cuda and v.is_cuda):
+        raise ValueError("q, k, v must be CUDA tensors")
+    if q.dim() != 4 or k.dim() != 4 or v.dim() != 4:
+        raise ValueError("q, k, v must be 4-D [B, H, N, D] tensors")
+    if q.shape != k.shape or q.shape != v.shape:
+        raise ValueError("q, k, v must have identical shapes")
+    if not (q.dtype == k.dtype == v.dtype):
+        raise ValueError("q, k, v must share a dtype")
+
+    B, H, N_CTX, HEAD_DIM = q.shape
+    if HEAD_DIM not in (16, 32, 64, 128, 256):
+        raise ValueError(f"unsupported head dim {HEAD_DIM}")
+
+    if q.stride(-1) != 1:
+        q = q.contiguous()
+    if k.stride(-1) != 1:
+        k = k.contiguous()
+    if v.stride(-1) != 1:
+        v = v.contiguous()
+
+    out = torch.empty_like(q)
+
+    if sm_scale is None:
+        sm_scale = HEAD_DIM ** -0.5
+    qk_scale = float(sm_scale) * 1.4426950408889634  # fold log2(e) -> use exp2
+
+    is_16bit = q.dtype in (torch.float16, torch.bfloat16)
+
+    if HEAD_DIM <= 64:
+        if is_16bit:
+            BLOCK_M, BLOCK_N, num_warps, num_stages = 128, 128, 8, 3
+        else:
+            BLOCK_M, BLOCK_N, num_warps, num_stages = 128, 64, 8, 2
+    elif HEAD_DIM == 128:
+        if is_16bit:
+            BLOCK_M, BLOCK_N, num_warps, num_stages = 128, 128, 8, 3
+        else:
+            BLOCK_M, BLOCK_N, num_warps, num_stages = 64, 64, 8, 2
+    else:
+        BLOCK_M, BLOCK_N, num_warps, num_stages = 64, 64, 8, 2
+
+    grid = (triton.cdiv(N_CTX, BLOCK_M), B * H, 1)
+
+    _attn_fwd[grid](
+        q, k, v, out,
+        qk_scale,
+        q.stride(0), q.stride(1), q.stride(2),
+        k.stride(0), k.stride(1), k.stride(2),
+        v.stride(0), v.stride(1), v.stride(2),
+        out.stride(0), out.stride(1), out.stride(2),
+        H, N_CTX,
+        HEAD_DIM=HEAD_DIM,
+        BLOCK_M=BLOCK_M,
+        BLOCK_N=BLOCK_N,
+        EVEN_N=(N_CTX % BLOCK_N == 0),
+        EVEN_M=(N_CTX % BLOCK_M == 0),
+        num_warps=num_warps,
+        num_stages=num_stages,
+    )
+    return out
+
+
+__all__ = ["kernel_function"]

@@ -13,6 +13,13 @@ core.[1-9]*
 .coverage.*
 coverage.xml
 *.csv
+!plots/cute461_rerun/helion_autotune_manifest.csv
+!/plots/generalized_full_autotune/*.csv
+!/plots/generalized_full_autotune/**/*.csv
+!/plots/attention_backends_b200_750w.csv
+!/plots/attention_varied_shapes_b200_750w.csv
+!/plots/kernelagent_tuning_usage.csv
+!/plots/kernelagent_closed_tuning_usage.csv
 CTAGS
 *.cuo
 CURRENT

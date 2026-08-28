@@ -1,0 +1,447 @@
+from __future__ import annotations
+
+import torch
+import triton
+import triton.language as tl
+
+
+# --------------------------------------------------------------------------- #
+# Prologue: max over keys of ||k_n||_2, per (batch, head).                     #
+# --------------------------------------------------------------------------- #
+@triton.jit
+def _k_bound_partial(K, P,
+                     stride_kz, stride_kh, stride_kn,
+                     H, N_CTX, NBLK,
+                     HEAD_DIM: tl.constexpr, BLOCK_N: tl.constexpr):
+    pid_n = tl.program_id(0)
+    off_hz = tl.program_id(1)
+    off_z = off_hz // H
+    off_h = off_hz % H
+
+    base = K + off_z.to(tl.int64) * stride_kz + off_h.to(tl.int64) * stride_kh
+    offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+    offs_d = tl.arange(0, HEAD_DIM)
+
+    kt = tl.load(base + offs_n[:, None] * stride_kn + offs_d[None, :],
+                 mask=offs_n[:, None] < N_CTX, other=0.0).to(tl.float32)
+    sq = tl.sum(kt * kt, 1)
+    tl.store(P + off_hz.to(tl.int64) * NBLK + pid_n, tl.max(sq, 0))
+
+
+@triton.jit
+def _k_bound_reduce(P, KB, NBLK, BLOCK: tl.constexpr):
+    off_hz = tl.program_id(0)
+    offs = tl.arange(0, BLOCK)
+    vals = tl.load(P + off_hz.to(tl.int64) * NBLK + offs,
+                   mask=offs < NBLK, other=0.0)
+    tl.store(KB + off_hz, tl.sqrt(tl.max(vals, 0)))
+
+
+# =========================================================================== #
+#  PATH A (legacy, always available): cp.async pipelined, warp-level MMA.      #
+#  Kept byte-for-byte as the verified best kernel -> hard performance floor.   #
+# =========================================================================== #
+def _fwd_configs():
+    return [
+        triton.Config({"BLOCK_M": 128, "BLOCK_N": 64}, num_stages=3, num_warps=8),
+        triton.Config({"BLOCK_M": 128, "BLOCK_N": 128}, num_stages=3, num_warps=8),
+        triton.Config({"BLOCK_M": 128, "BLOCK_N": 64}, num_stages=4, num_warps=8),
+        triton.Config({"BLOCK_M": 64, "BLOCK_N": 64}, num_stages=4, num_warps=4),
+    ]
+
+
+@triton.jit
+def _attn_fwd_inner(acc, l_i, q, m_row,
+                    K_base, V_base,
+                    stride_kn, stride_vn,
+                    start_m,
+                    qk_scale,
+                    offs_m, offs_n, offs_d,
+                    N_CTX,
+                    BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr,
+                    HEAD_DIM: tl.constexpr, STAGE: tl.constexpr):
+    if STAGE == 1:
+        lo = 0
+        hi = start_m * BLOCK_M
+    elif STAGE == 2:
+        lo = start_m * BLOCK_M
+        hi = tl.minimum((start_m + 1) * BLOCK_M, N_CTX)
+        lo = tl.multiple_of(lo, BLOCK_M)
+    else:
+        lo = 0
+        hi = N_CTX
+
+    k_ptrs = K_base + (lo + offs_n)[None, :] * stride_kn + offs_d[:, None]
+    v_ptrs = V_base + (lo + offs_n)[:, None] * stride_vn + offs_d[None, :]
+
+    for start_n in tl.range(lo, hi, BLOCK_N):
+        if STAGE == 1:
+            k = tl.load(k_ptrs)
+            qk = tl.dot(q, k)
+            p = tl.math.exp2(qk * qk_scale - m_row[:, None])
+            l_i += tl.sum(p, 1)
+            v = tl.load(v_ptrs)
+            acc = tl.dot(p.to(v.dtype), v, acc)
+        else:
+            offs_kn = start_n + offs_n
+            k = tl.load(k_ptrs, mask=offs_kn[None, :] < N_CTX, other=0.0)
+            qk = tl.dot(q, k)
+            p = tl.math.exp2(qk * qk_scale - m_row[:, None])
+            if STAGE == 2:
+                p = tl.where(offs_m[:, None] >= offs_kn[None, :], p, 0.0)
+            else:
+                p = tl.where(offs_kn[None, :] < N_CTX, p, 0.0)
+            l_i += tl.sum(p, 1)
+            v = tl.load(v_ptrs, mask=offs_kn[:, None] < N_CTX, other=0.0)
+            acc = tl.dot(p.to(v.dtype), v, acc)
+
+        k_ptrs += BLOCK_N * stride_kn
+        v_ptrs += BLOCK_N * stride_vn
+
+    return acc, l_i
+
+
+@triton.autotune(configs=_fwd_configs(), key=["N_CTX", "HEAD_DIM", "CAUSAL"])
+@triton.jit
+def _attn_fwd(Q, K, V, Out, KBND,
+              sm_scale,
+              stride_qz, stride_qh, stride_qm,
+              stride_kz, stride_kh, stride_kn,
+              stride_vz, stride_vh, stride_vn,
+              stride_oz, stride_oh, stride_om,
+              Z, H, N_CTX,
+              HEAD_DIM: tl.constexpr,
+              BLOCK_M: tl.constexpr,
+              BLOCK_N: tl.constexpr,
+              CAUSAL: tl.constexpr):
+    pid = tl.program_id(0)
+    num_m = tl.num_programs(0)
+    half = pid // 2
+    start_m = tl.where((pid % 2) == 0, half, num_m - 1 - half)
+
+    off_hz = tl.program_id(1)
+    off_z = off_hz // H
+    off_h = off_hz % H
+
+    q_base = Q + off_z.to(tl.int64) * stride_qz + off_h.to(tl.int64) * stride_qh
+    k_base = K + off_z.to(tl.int64) * stride_kz + off_h.to(tl.int64) * stride_kh
+    v_base = V + off_z.to(tl.int64) * stride_vz + off_h.to(tl.int64) * stride_vh
+    o_base = Out + off_z.to(tl.int64) * stride_oz + off_h.to(tl.int64) * stride_oh
+
+    offs_m = start_m * BLOCK_M + tl.arange(0, BLOCK_M)
+    offs_n = tl.arange(0, BLOCK_N)
+    offs_d = tl.arange(0, HEAD_DIM)
+
+    qk_scale = sm_scale * 1.4426950408889634
+
+    q = tl.load(q_base + offs_m[:, None] * stride_qm + offs_d[None, :],
+                mask=offs_m[:, None] < N_CTX, other=0.0)
+
+    qf = q.to(tl.float32)
+    q_norm = tl.sqrt(tl.sum(qf * qf, 1))
+    k_norm = tl.load(KBND + off_hz)
+    m_row = q_norm * k_norm * qk_scale - 13.0
+
+    l_i = tl.zeros([BLOCK_M], dtype=tl.float32)
+    acc = tl.zeros([BLOCK_M, HEAD_DIM], dtype=tl.float32)
+
+    if CAUSAL:
+        acc, l_i = _attn_fwd_inner(acc, l_i, q, m_row,
+                                   k_base, v_base, stride_kn, stride_vn,
+                                   start_m, qk_scale,
+                                   offs_m, offs_n, offs_d, N_CTX,
+                                   BLOCK_M, BLOCK_N, HEAD_DIM, 1)
+        acc, l_i = _attn_fwd_inner(acc, l_i, q, m_row,
+                                   k_base, v_base, stride_kn, stride_vn,
+                                   start_m, qk_scale,
+                                   offs_m, offs_n, offs_d, N_CTX,
+                                   BLOCK_M, BLOCK_N, HEAD_DIM, 2)
+    else:
+        acc, l_i = _attn_fwd_inner(acc, l_i, q, m_row,
+                                   k_base, v_base, stride_kn, stride_vn,
+                                   start_m, qk_scale,
+                                   offs_m, offs_n, offs_d, N_CTX,
+                                   BLOCK_M, BLOCK_N, HEAD_DIM, 3)
+
+    l_safe = tl.where(l_i > 0.0, l_i, 1.0)
+    acc = acc / l_safe[:, None]
+    tl.store(o_base + offs_m[:, None] * stride_om + offs_d[None, :],
+             acc.to(Out.dtype.element_ty), mask=offs_m[:, None] < N_CTX)
+
+
+# =========================================================================== #
+#  PATH B (Blackwell): TMA-descriptor operands + optional warp specialization. #
+#  Keeping K/V tiles resident in SMEM behind TMA lets the backend lower both   #
+#  tl.dot's to tcgen05 (MMAv5) instead of the 595 TFLOPS legacy mma.sync path. #
+# =========================================================================== #
+def _tma_configs():
+    return [
+        triton.Config({"BLOCK_M": 128, "BLOCK_N": 128}, num_stages=3, num_warps=8),
+        triton.Config({"BLOCK_M": 128, "BLOCK_N": 64}, num_stages=4, num_warps=8),
+        triton.Config({"BLOCK_M": 128, "BLOCK_N": 128}, num_stages=2, num_warps=4),
+    ]
+
+
+@triton.jit
+def _tma_step(acc, l_i, q, m_row, desc_k, desc_v, y, start_n,
+              qk_scale, offs_m, offs_n, STAGE: tl.constexpr):
+    kt = desc_k.load([y, 0])
+    qk = tl.dot(q, tl.trans(kt))
+    p = tl.math.exp2(qk * qk_scale - m_row[:, None])
+    if STAGE == 2:
+        p = tl.where(offs_m[:, None] >= (start_n + offs_n)[None, :], p, 0.0)
+    l_i += tl.sum(p, 1)
+    vt = desc_v.load([y, 0])
+    acc = tl.dot(p.to(kt.dtype), vt, acc)
+    return acc, l_i
+
+
+@triton.jit
+def _tma_inner(acc, l_i, q, m_row, desc_k, desc_v, y_hz, start_m,
+               qk_scale, offs_m, offs_n, N_CTX,
+               BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr,
+               STAGE: tl.constexpr, WS: tl.constexpr):
+    if STAGE == 2:
+        lo = start_m * BLOCK_M
+        lo = tl.multiple_of(lo, BLOCK_M)
+        hi = lo + BLOCK_M
+        for start_n in tl.range(lo, hi, BLOCK_N):
+            acc, l_i = _tma_step(acc, l_i, q, m_row, desc_k, desc_v,
+                                 y_hz + start_n, start_n, qk_scale,
+                                 offs_m, offs_n, 2)
+    else:
+        if STAGE == 1:
+            lo = 0
+            hi = start_m * BLOCK_M
+        else:
+            lo = 0
+            hi = N_CTX
+        if WS:
+            for start_n in tl.range(lo, hi, BLOCK_N, warp_specialize=True):
+                acc, l_i = _tma_step(acc, l_i, q, m_row, desc_k, desc_v,
+                                     y_hz + start_n, start_n, qk_scale,
+                                     offs_m, offs_n, 1)
+        else:
+            for start_n in tl.range(lo, hi, BLOCK_N):
+                acc, l_i = _tma_step(acc, l_i, q, m_row, desc_k, desc_v,
+                                     y_hz + start_n, start_n, qk_scale,
+                                     offs_m, offs_n, 1)
+    return acc, l_i
+
+
+@triton.autotune(configs=_tma_configs(), key=["N_CTX", "HEAD_DIM", "CAUSAL", "WS"])
+@triton.jit
+def _attn_fwd_tma(Q, K, V, Out, KBND,
+                  sm_scale, NROW, N_CTX,
+                  HEAD_DIM: tl.constexpr,
+                  BLOCK_M: tl.constexpr,
+                  BLOCK_N: tl.constexpr,
+                  CAUSAL: tl.constexpr,
+                  WS: tl.constexpr):
+    pid = tl.program_id(0)
+    num_m = tl.num_programs(0)
+    half = pid // 2
+    start_m = tl.where((pid % 2) == 0, half, num_m - 1 - half)
+    off_hz = tl.program_id(1)
+
+    desc_k = tl.make_tensor_descriptor(K, [NROW, HEAD_DIM], [HEAD_DIM, 1],
+                                       [BLOCK_N, HEAD_DIM])
+    desc_v = tl.make_tensor_descriptor(V, [NROW, HEAD_DIM], [HEAD_DIM, 1],
+                                       [BLOCK_N, HEAD_DIM])
+
+    y_hz = off_hz * N_CTX
+    offs_m = start_m * BLOCK_M + tl.arange(0, BLOCK_M)
+    offs_n = tl.arange(0, BLOCK_N)
+    offs_d = tl.arange(0, HEAD_DIM)
+
+    qk_scale = sm_scale * 1.4426950408889634
+
+    row0 = (y_hz + start_m * BLOCK_M).to(tl.int64)
+    rows = row0 + tl.arange(0, BLOCK_M).to(tl.int64)
+    q = tl.load(Q + rows[:, None] * HEAD_DIM + offs_d[None, :])
+
+    qf = q.to(tl.float32)
+    q_norm = tl.sqrt(tl.sum(qf * qf, 1))
+    k_norm = tl.load(KBND + off_hz)
+    m_row = q_norm * k_norm * qk_scale - 13.0
+
+    l_i = tl.zeros([BLOCK_M], dtype=tl.float32)
+    acc = tl.zeros([BLOCK_M, HEAD_DIM], dtype=tl.float32)
+
+    if CAUSAL:
+        acc, l_i = _tma_inner(acc, l_i, q, m_row, desc_k, desc_v, y_hz, start_m,
+                              qk_scale, offs_m, offs_n, N_CTX,
+                              BLOCK_M, BLOCK_N, 1, WS)
+        acc, l_i = _tma_inner(acc, l_i, q, m_row, desc_k, desc_v, y_hz, start_m,
+                              qk_scale, offs_m, offs_n, N_CTX,
+                              BLOCK_M, BLOCK_N, 2, WS)
+    else:
+        acc, l_i = _tma_inner(acc, l_i, q, m_row, desc_k, desc_v, y_hz, start_m,
+                              qk_scale, offs_m, offs_n, N_CTX,
+                              BLOCK_M, BLOCK_N, 3, WS)
+
+    l_safe = tl.where(l_i > 0.0, l_i, 1.0)
+    acc = acc / l_safe[:, None]
+    tl.store(Out + rows[:, None] * HEAD_DIM + offs_d[None, :],
+             acc.to(Out.dtype.element_ty))
+
+
+# --------------------------------------------------------------------------- #
+# Host-side plumbing                                                           #
+# --------------------------------------------------------------------------- #
+_HAS_TMA = hasattr(tl, "make_tensor_descriptor") and hasattr(triton, "set_allocator")
+_ALLOC_DONE = [False]
+_MODE: dict = {}
+
+
+def _tma_alloc(size, alignment, stream):
+    return torch.empty(size, device="cuda", dtype=torch.int8)
+
+
+def _ensure_allocator():
+    if not _ALLOC_DONE[0]:
+        triton.set_allocator(_tma_alloc)
+        _ALLOC_DONE[0] = True
+
+
+def _key_bound(k, Z, H, N_CTX, HEAD_DIM):
+    BLOCK_NP = 256 if N_CTX >= 256 else 64
+    nblk = triton.cdiv(N_CTX, BLOCK_NP)
+    part = torch.empty((Z * H, nblk), device=k.device, dtype=torch.float32)
+    kbnd = torch.empty((Z * H,), device=k.device, dtype=torch.float32)
+    _k_bound_partial[(nblk, Z * H)](
+        k, part,
+        k.stride(0), k.stride(1), k.stride(2),
+        H, N_CTX, nblk,
+        HEAD_DIM=HEAD_DIM, BLOCK_N=BLOCK_NP,
+        num_warps=8, num_stages=2,
+    )
+    BLOCK_R = max(16, triton.next_power_of_2(nblk))
+    _k_bound_reduce[(Z * H,)](part, kbnd, nblk, BLOCK=BLOCK_R, num_warps=4)
+    return kbnd
+
+
+def _run_legacy(q, k, v, out, kbnd, sm_scale, is_causal, Z, H, N_CTX, HEAD_DIM):
+    grid = lambda META: (triton.cdiv(N_CTX, META["BLOCK_M"]), Z * H, 1)
+    _attn_fwd[grid](
+        q, k, v, out, kbnd,
+        float(sm_scale),
+        q.stride(0), q.stride(1), q.stride(2),
+        k.stride(0), k.stride(1), k.stride(2),
+        v.stride(0), v.stride(1), v.stride(2),
+        out.stride(0), out.stride(1), out.stride(2),
+        Z, H, N_CTX,
+        HEAD_DIM=HEAD_DIM,
+        CAUSAL=bool(is_causal),
+    )
+
+
+def _run_tma(q, k, v, out, kbnd, sm_scale, is_causal, Z, H, N_CTX, HEAD_DIM, ws):
+    _ensure_allocator()
+    nrow = Z * H * N_CTX
+    grid = lambda META: (N_CTX // META["BLOCK_M"], Z * H, 1)
+    _attn_fwd_tma[grid](
+        q, k, v, out, kbnd,
+        float(sm_scale), nrow, N_CTX,
+        HEAD_DIM=HEAD_DIM,
+        CAUSAL=bool(is_causal),
+        WS=ws,
+    )
+
+
+def _tma_eligible(q, k, v, out, N_CTX, HEAD_DIM):
+    if not _HAS_TMA:
+        return False
+    if N_CTX % 128 != 0:
+        return False
+    if HEAD_DIM not in (32, 64, 128):
+        return False
+    if q.dtype not in (torch.float16, torch.bfloat16):
+        return False
+    for t in (q, k, v, out):
+        if not t.is_contiguous():
+            return False
+        if t.data_ptr() % 16 != 0:
+            return False
+    return True
+
+
+def _timed(fn):
+    fn()
+    torch.cuda.synchronize()
+    s = torch.cuda.Event(enable_timing=True)
+    e = torch.cuda.Event(enable_timing=True)
+    s.record()
+    fn()
+    fn()
+    e.record()
+    torch.cuda.synchronize()
+    return s.elapsed_time(e) * 0.5
+
+
+def kernel_function(q: torch.Tensor,
+                    k: torch.Tensor,
+                    v: torch.Tensor,
+                    sm_scale: float | None = None,
+                    is_causal: bool = True) -> torch.Tensor:
+    """Causal scaled-dot-product attention, fully fused in Triton."""
+    if not (q.is_cuda and k.is_cuda and v.is_cuda):
+        raise ValueError("q, k, v must be CUDA tensors")
+    if q.dim() != 4 or k.dim() != 4 or v.dim() != 4:
+        raise ValueError("q, k, v must be 4-D [B, H, N, D] tensors")
+    if not (q.shape == k.shape == v.shape):
+        raise ValueError("q, k, v must have identical shapes")
+    if not (q.dtype == k.dtype == v.dtype):
+        raise ValueError("q, k, v must have identical dtypes")
+    if q.stride(-1) != 1 or k.stride(-1) != 1 or v.stride(-1) != 1:
+        raise ValueError("q, k, v must be contiguous in the head-dim axis")
+
+    Z, H, N_CTX, HEAD_DIM = q.shape
+    if HEAD_DIM not in (16, 32, 64, 128, 256):
+        raise ValueError(f"unsupported head dim {HEAD_DIM}")
+
+    if sm_scale is None:
+        sm_scale = 1.0 / (HEAD_DIM ** 0.5)
+
+    out = torch.empty_like(q)
+    kbnd = _key_bound(k, Z, H, N_CTX, HEAD_DIM)
+
+    ck = (Z, H, N_CTX, HEAD_DIM, bool(is_causal), q.dtype, float(sm_scale))
+    mode = _MODE.get(ck)
+
+    if mode is None:
+        mode = ("legacy", False)
+        best = None
+        try:
+            best = _timed(lambda: _run_legacy(q, k, v, out, kbnd, sm_scale,
+                                              is_causal, Z, H, N_CTX, HEAD_DIM))
+        except Exception:
+            best = None
+
+        if _tma_eligible(q, k, v, out, N_CTX, HEAD_DIM):
+            for ws in (True, False):
+                try:
+                    t = _timed(lambda: _run_tma(q, k, v, out, kbnd, sm_scale,
+                                                is_causal, Z, H, N_CTX,
+                                                HEAD_DIM, ws))
+                except Exception:
+                    continue
+                if best is None or t < best:
+                    best = t
+                    mode = ("tma", ws)
+                if ws:
+                    break
+        if best is None:
+            raise RuntimeError("no viable attention kernel configuration")
+        _MODE[ck] = mode
+
+    if mode[0] == "tma":
+        try:
+            _run_tma(q, k, v, out, kbnd, sm_scale, is_causal,
+                     Z, H, N_CTX, HEAD_DIM, mode[1])
+            return out
+        except Exception:
+            _MODE[ck] = ("legacy", False)
+
+    _run_legacy(q, k, v, out, kbnd, sm_scale, is_causal, Z, H, N_CTX, HEAD_DIM)
+    return out

@@ -1,0 +1,389 @@
+from __future__ import annotations
+
+import torch
+import triton
+import triton.language as tl
+
+
+_HAS_TMA = hasattr(tl, "make_tensor_descriptor") and hasattr(triton, "set_allocator")
+_ALLOCATOR_READY = False
+
+
+def _ensure_allocator():
+    global _ALLOCATOR_READY
+    if _HAS_TMA and not _ALLOCATOR_READY:
+        def _alloc_fn(size, alignment, stream):
+            return torch.empty(size, device="cuda", dtype=torch.int8)
+        triton.set_allocator(_alloc_fn)
+        _ALLOCATOR_READY = True
+
+
+# ---------------------------------------------------------------------------
+# Classic pointer-based fused attention (reference / fallback path).
+# ---------------------------------------------------------------------------
+@triton.jit
+def _attn_fwd(
+    Q, K, V, Out,
+    qk_scale,
+    stride_qz, stride_qh, stride_qm, stride_qk,
+    stride_kz, stride_kh, stride_kn, stride_kk,
+    stride_vz, stride_vh, stride_vn, stride_vk,
+    stride_oz, stride_oh, stride_om, stride_ok,
+    H, N_CTX,
+    HEAD_DIM: tl.constexpr,
+    BLOCK_M: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    EVEN_M: tl.constexpr,
+    EVEN_N: tl.constexpr,
+):
+    start_m = tl.program_id(0)
+    off_hz = tl.program_id(1)
+    off_z = off_hz // H
+    off_h = off_hz % H
+
+    zh_q = off_z.to(tl.int64) * stride_qz + off_h.to(tl.int64) * stride_qh
+    zh_k = off_z.to(tl.int64) * stride_kz + off_h.to(tl.int64) * stride_kh
+    zh_v = off_z.to(tl.int64) * stride_vz + off_h.to(tl.int64) * stride_vh
+    zh_o = off_z.to(tl.int64) * stride_oz + off_h.to(tl.int64) * stride_oh
+
+    q_base = Q + zh_q
+    k_base = K + zh_k
+    v_base = V + zh_v
+    o_base = Out + zh_o
+
+    offs_m = start_m * BLOCK_M + tl.arange(0, BLOCK_M)
+    offs_n = tl.arange(0, BLOCK_N)
+    offs_d = tl.arange(0, HEAD_DIM)
+
+    q_ptrs = q_base + offs_m[:, None] * stride_qm + offs_d[None, :] * stride_qk
+    if EVEN_M:
+        q = tl.load(q_ptrs)
+    else:
+        q = tl.load(q_ptrs, mask=offs_m[:, None] < N_CTX, other=0.0)
+
+    k_ptrs = k_base + offs_n[:, None] * stride_kn + offs_d[None, :] * stride_kk
+    v_ptrs = v_base + offs_n[:, None] * stride_vn + offs_d[None, :] * stride_vk
+
+    m_i = tl.full([BLOCK_M], -1.0e30, dtype=tl.float32)
+    l_i = tl.zeros([BLOCK_M], dtype=tl.float32)
+    acc = tl.zeros([BLOCK_M, HEAD_DIM], dtype=tl.float32)
+
+    p_dtype = K.dtype.element_ty
+
+    for start_n in range(0, N_CTX, BLOCK_N):
+        if EVEN_N:
+            k = tl.load(k_ptrs)
+            v = tl.load(v_ptrs)
+        else:
+            n_mask = (start_n + offs_n)[:, None] < N_CTX
+            k = tl.load(k_ptrs, mask=n_mask, other=0.0)
+            v = tl.load(v_ptrs, mask=n_mask, other=0.0)
+
+        qk = tl.dot(q, tl.trans(k))
+        if not EVEN_N:
+            qk = tl.where((start_n + offs_n)[None, :] < N_CTX, qk, -3.0e4)
+
+        m_ij = tl.maximum(m_i, tl.max(qk, 1) * qk_scale)
+        p = tl.math.exp2(qk * qk_scale - m_ij[:, None])
+        alpha = tl.math.exp2(m_i - m_ij)
+
+        l_i = l_i * alpha + tl.sum(p, 1)
+        acc = acc * alpha[:, None]
+
+        acc = tl.dot(p.to(p_dtype), v, acc)
+        m_i = m_ij
+
+        k_ptrs += BLOCK_N * stride_kn
+        v_ptrs += BLOCK_N * stride_vn
+
+    acc = acc / l_i[:, None]
+    o_ptrs = o_base + offs_m[:, None] * stride_om + offs_d[None, :] * stride_ok
+    if EVEN_M:
+        tl.store(o_ptrs, acc.to(Out.dtype.element_ty))
+    else:
+        tl.store(o_ptrs, acc.to(Out.dtype.element_ty),
+                 mask=offs_m[:, None] < N_CTX)
+
+
+# ---------------------------------------------------------------------------
+# TMA (+ optional warp-specialized) fused attention.
+#
+# The [B, H, N, D] contiguous tensors are viewed as a 2-D [B*H*N, D] surface so
+# a single tensor descriptor per operand can serve every (batch, head).
+# `tl.range(..., warp_specialize=True)` splits the loop into producer warps
+# (async TMA fills of K/V) and consumer warps (MMA + online softmax), which is
+# the only way to break the MMA -> softmax -> MMA dependency chain that leaves
+# both the tensor pipe and the FMA/MUFU pipes half idle.
+# ---------------------------------------------------------------------------
+@triton.jit
+def _attn_fwd_tma(
+    Q, K, V, Out,
+    qk_scale,
+    Y_DIM, N_CTX,
+    HEAD_DIM: tl.constexpr,
+    BLOCK_M: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    EVEN_N: tl.constexpr,
+    WS: tl.constexpr,
+):
+    start_m = tl.program_id(0)
+    off_hz = tl.program_id(1)
+
+    desc_q = tl.make_tensor_descriptor(
+        Q, shape=[Y_DIM, HEAD_DIM], strides=[HEAD_DIM, 1],
+        block_shape=[BLOCK_M, HEAD_DIM])
+    desc_k = tl.make_tensor_descriptor(
+        K, shape=[Y_DIM, HEAD_DIM], strides=[HEAD_DIM, 1],
+        block_shape=[BLOCK_N, HEAD_DIM])
+    desc_v = tl.make_tensor_descriptor(
+        V, shape=[Y_DIM, HEAD_DIM], strides=[HEAD_DIM, 1],
+        block_shape=[BLOCK_N, HEAD_DIM])
+    desc_o = tl.make_tensor_descriptor(
+        Out, shape=[Y_DIM, HEAD_DIM], strides=[HEAD_DIM, 1],
+        block_shape=[BLOCK_M, HEAD_DIM])
+
+    offset_y = off_hz * N_CTX
+    qo_y = offset_y + start_m * BLOCK_M
+
+    offs_n = tl.arange(0, BLOCK_N)
+
+    m_i = tl.full([BLOCK_M], -1.0e30, dtype=tl.float32)
+    l_i = tl.zeros([BLOCK_M], dtype=tl.float32)
+    acc = tl.zeros([BLOCK_M, HEAD_DIM], dtype=tl.float32)
+
+    q = desc_q.load([qo_y, 0])
+    p_dtype = K.dtype.element_ty
+
+    for start_n in tl.range(0, N_CTX, BLOCK_N, warp_specialize=WS):
+        start_n = tl.multiple_of(start_n, BLOCK_N)
+        kv_y = offset_y + start_n
+
+        k = desc_k.load([kv_y, 0])
+        qk = tl.dot(q, tl.trans(k))
+        if not EVEN_N:
+            qk = tl.where((start_n + offs_n)[None, :] < N_CTX, qk, -3.0e4)
+
+        m_ij = tl.maximum(m_i, tl.max(qk, 1) * qk_scale)
+        p = tl.math.exp2(qk * qk_scale - m_ij[:, None])
+        alpha = tl.math.exp2(m_i - m_ij)
+
+        l_i = l_i * alpha + tl.sum(p, 1)
+        acc = acc * alpha[:, None]
+
+        v = desc_v.load([kv_y, 0])
+        acc = tl.dot(p.to(p_dtype), v, acc)
+        m_i = m_ij
+
+    acc = acc / l_i[:, None]
+    desc_o.store([qo_y, 0], acc.to(Out.dtype.element_ty))
+
+
+# ---------------------------------------------------------------------------
+# Launch helpers
+# ---------------------------------------------------------------------------
+def _launch(cfg, q, k, v, out, qk_scale):
+    kind, BM, BN, nw, ns, mnr = cfg
+    B, H, N_CTX, D = q.shape
+    grid = (triton.cdiv(N_CTX, BM), B * H, 1)
+    extra = {"num_warps": nw, "num_stages": ns}
+    if mnr is not None:
+        extra["maxnreg"] = mnr
+
+    if kind == "classic":
+        _attn_fwd[grid](
+            q, k, v, out,
+            qk_scale,
+            q.stride(0), q.stride(1), q.stride(2), q.stride(3),
+            k.stride(0), k.stride(1), k.stride(2), k.stride(3),
+            v.stride(0), v.stride(1), v.stride(2), v.stride(3),
+            out.stride(0), out.stride(1), out.stride(2), out.stride(3),
+            H, N_CTX,
+            HEAD_DIM=D,
+            BLOCK_M=BM,
+            BLOCK_N=BN,
+            EVEN_M=(N_CTX % BM == 0),
+            EVEN_N=(N_CTX % BN == 0),
+            **extra,
+        )
+    else:
+        _ensure_allocator()
+        _attn_fwd_tma[grid](
+            q, k, v, out,
+            qk_scale,
+            B * H * N_CTX, N_CTX,
+            HEAD_DIM=D,
+            BLOCK_M=BM,
+            BLOCK_N=BN,
+            EVEN_N=(N_CTX % BN == 0),
+            WS=(kind == "tma_ws"),
+            **extra,
+        )
+
+
+def _classic_fallbacks(D):
+    return [("classic", 64, 64, 4, 2, None),
+            ("classic", 64, 32, 4, 2, None),
+            ("classic", 32, 32, 4, 1, None)]
+
+
+def _candidates(q):
+    B, H, N, D = q.shape
+    cands = []
+    base = (128, 64, 8, 3) if D <= 128 else (64, 64, 4, 2)
+    cands.append(("classic",) + base + (None,))
+
+    tma_ok = (_HAS_TMA
+              and q.is_contiguous()
+              and (D * q.element_size()) % 16 == 0
+              and D >= 16)
+    if tma_ok:
+        if D <= 128:
+            tiles = [(128, 128, 8, 3), (128, 64, 8, 3)]
+        else:
+            tiles = [(64, 64, 4, 2)]
+        for (bm, bn, nw, ns) in tiles:
+            if N % bm == 0:
+                cands.append(("tma_ws", bm, bn, nw, ns, None))
+        for (bm, bn, nw, ns) in tiles:
+            if N % bm == 0:
+                cands.append(("tma", bm, bn, nw, ns, None))
+        if D <= 64 and N % 128 == 0:
+            cands.append(("tma_ws", 128, 128, 8, 3, 80))
+    return cands
+
+
+def _bench(fn, iters=2):
+    fn()
+    torch.cuda.synchronize()
+    s = torch.cuda.Event(enable_timing=True)
+    e = torch.cuda.Event(enable_timing=True)
+    s.record()
+    for _ in range(iters):
+        fn()
+    e.record()
+    torch.cuda.synchronize()
+    return s.elapsed_time(e) / iters
+
+
+def _select_plan(q, k, v, out, qk_scale):
+    B, H, N, D = q.shape
+    cands = _candidates(q)
+
+    if len(cands) == 1:
+        cfg = cands[0]
+        try:
+            _launch(cfg, q, k, v, out, qk_scale)
+            return cfg
+        except Exception:
+            for fb in _classic_fallbacks(D):
+                try:
+                    _launch(fb, q, k, v, out, qk_scale)
+                    return fb
+                except Exception:
+                    continue
+            raise
+
+    # ---- cheap probe on a short-sequence slice (same B/H/D, same binaries) --
+    NP = 16384
+    owned = False
+    if N > NP and (N % 128 == 0):
+        qp = q[:, :, :NP, :].contiguous()
+        kp = k[:, :, :NP, :].contiguous()
+        vp = v[:, :, :NP, :].contiguous()
+        op = torch.empty_like(qp)
+        owned = True
+    else:
+        qp, kp, vp, op = q, k, v, out
+
+    ref = None
+    best_cfg = None
+    best_t = float("inf")
+
+    for cfg in cands:
+        _, bm, bn, _, _, _ = cfg
+        if qp.shape[2] % bm != 0 and qp.shape[2] > bm:
+            if cfg[0] != "classic":
+                continue
+        try:
+            _launch(cfg, qp, kp, vp, op, qk_scale)
+            torch.cuda.synchronize()
+        except Exception:
+            continue
+
+        if ref is None:
+            ref = op.clone()
+        else:
+            try:
+                if not torch.allclose(op, ref, atol=1e-3, rtol=1e-2):
+                    continue
+            except Exception:
+                continue
+
+        try:
+            t = _bench(lambda c=cfg: _launch(c, qp, kp, vp, op, qk_scale))
+        except Exception:
+            continue
+
+        if t < best_t:
+            best_t = t
+            best_cfg = cfg
+
+    if owned:
+        del qp, kp, vp, op
+    del ref
+
+    if best_cfg is None:
+        for fb in [cands[0]] + _classic_fallbacks(D):
+            try:
+                _launch(fb, q, k, v, out, qk_scale)
+                return fb
+            except Exception:
+                continue
+        raise RuntimeError("no viable attention configuration")
+
+    _launch(best_cfg, q, k, v, out, qk_scale)
+    return best_cfg
+
+
+_PLAN_CACHE: dict = {}
+
+
+# ---------------------------------------------------------------------------
+# public API
+# ---------------------------------------------------------------------------
+def kernel_function(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor,
+                    sm_scale: float | None = None) -> torch.Tensor:
+    if q.ndim != 4 or k.ndim != 4 or v.ndim != 4:
+        raise ValueError("q, k, v must be 4-D [B, H, N, D] tensors")
+    if not (q.is_cuda and k.is_cuda and v.is_cuda):
+        raise ValueError("q, k, v must live on a CUDA device")
+    if q.dtype != k.dtype or q.dtype != v.dtype:
+        raise ValueError("q, k, v must share the same dtype")
+    if q.shape != k.shape or q.shape != v.shape:
+        raise ValueError("this kernel expects q, k, v to have identical shapes")
+
+    B, H, N_CTX, HEAD_DIM = q.shape
+    if HEAD_DIM not in (16, 32, 64, 128, 256):
+        raise ValueError(f"unsupported head dim {HEAD_DIM}")
+
+    if sm_scale is None:
+        sm_scale = 1.0 / (HEAD_DIM ** 0.5)
+    if sm_scale <= 0.0:
+        raise ValueError("sm_scale must be positive")
+
+    qk_scale = sm_scale * 1.44269504088896340736
+
+    out = torch.empty_like(q)
+
+    key = (q.dtype, HEAD_DIM, N_CTX, B * H,
+           q.is_contiguous() and k.is_contiguous() and v.is_contiguous(),
+           q.device.index)
+
+    cfg = _PLAN_CACHE.get(key)
+    if cfg is None:
+        cfg = _select_plan(q, k, v, out, qk_scale)
+        _PLAN_CACHE[key] = cfg
+        return out
+
+    _launch(cfg, q, k, v, out, qk_scale)
+    return out

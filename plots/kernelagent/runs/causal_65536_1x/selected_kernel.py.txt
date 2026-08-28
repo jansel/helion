@@ -1,0 +1,199 @@
+from __future__ import annotations
+
+import torch
+import triton
+import triton.language as tl
+
+
+# --------------------------------------------------------------------------- #
+# Autotune space: mixes the classic high-throughput schedule with low
+# register / low shared-memory schedules that allow 3-5 resident blocks per SM.
+# --------------------------------------------------------------------------- #
+def _fwd_configs():
+    space = [
+        (128, 64, 8, 3),
+        (128, 64, 8, 2),
+        (128, 32, 4, 3),
+        (64, 64, 4, 3),
+        (64, 64, 4, 4),
+    ]
+    return [
+        triton.Config({"BLOCK_M": bm, "BLOCK_N": bn}, num_warps=w, num_stages=s)
+        for (bm, bn, w, s) in space
+    ]
+
+
+@triton.jit
+def _attn_fwd_inner(acc, l_i, m_i, q,
+                    K_base, V_base,
+                    stride_kn, stride_kk,
+                    stride_vn, stride_vk,
+                    qk_scale,
+                    offs_m, offs_n, offs_d,
+                    lo, hi, N_CTX,
+                    STAGE: tl.constexpr,
+                    EVEN_N: tl.constexpr,
+                    BLOCK_M: tl.constexpr,
+                    BLOCK_N: tl.constexpr,
+                    HEAD_DIM: tl.constexpr):
+    # K is read directly in [HEAD_DIM, BLOCK_N] layout -> no tl.trans() and no
+    # shared-memory transpose/barrier inside the loop.
+    offs_n0 = lo + offs_n
+    k_ptrs = K_base + offs_d[:, None] * stride_kk + offs_n0[None, :] * stride_kn
+    v_ptrs = V_base + offs_n0[:, None] * stride_vn + offs_d[None, :] * stride_vk
+
+    for start_n in tl.range(lo, hi, BLOCK_N):
+        start_n = tl.multiple_of(start_n, BLOCK_N)
+
+        if EVEN_N:
+            k = tl.load(k_ptrs)
+            qk = tl.dot(q, k)
+            if STAGE == 2:
+                causal = offs_m[:, None] >= (start_n + offs_n)[None, :]
+                s = tl.where(causal, qk * qk_scale, -1.0e6)
+                m_ij = tl.maximum(m_i, tl.max(s, 1))
+                p = tl.math.exp2(s - m_ij[:, None])
+            else:
+                # single FMA per element: scale folded into the max-subtraction
+                m_ij = tl.maximum(m_i, tl.max(qk, 1) * qk_scale)
+                p = tl.math.exp2(qk * qk_scale - m_ij[:, None])
+        else:
+            n_mask = (start_n + offs_n) < N_CTX
+            k = tl.load(k_ptrs, mask=n_mask[None, :], other=0.0)
+            qk = tl.dot(q, k)
+            s = qk * qk_scale
+            if STAGE == 2:
+                causal = offs_m[:, None] >= (start_n + offs_n)[None, :]
+                s = tl.where(causal, s, -1.0e6)
+            s = tl.where(n_mask[None, :], s, -1.0e6)
+            m_ij = tl.maximum(m_i, tl.max(s, 1))
+            p = tl.math.exp2(s - m_ij[:, None])
+
+        alpha = tl.math.exp2(m_i - m_ij)
+        l_i = l_i * alpha + tl.sum(p, 1)
+        acc = acc * alpha[:, None]
+
+        if EVEN_N:
+            v = tl.load(v_ptrs)
+        else:
+            n_mask2 = (start_n + offs_n) < N_CTX
+            v = tl.load(v_ptrs, mask=n_mask2[:, None], other=0.0)
+
+        acc = tl.dot(p.to(v.dtype), v, acc)
+        m_i = m_ij
+
+        k_ptrs += BLOCK_N * stride_kn
+        v_ptrs += BLOCK_N * stride_vn
+
+    return acc, l_i, m_i
+
+
+@triton.autotune(configs=_fwd_configs(), key=["N_CTX", "HEAD_DIM", "CAUSAL"])
+@triton.jit
+def _attn_fwd(Q, K, V, Out,
+              sm_scale,
+              stride_qz, stride_qh, stride_qm, stride_qk,
+              stride_kz, stride_kh, stride_kn, stride_kk,
+              stride_vz, stride_vh, stride_vn, stride_vk,
+              stride_oz, stride_oh, stride_om, stride_ok,
+              H, N_CTX,
+              HEAD_DIM: tl.constexpr,
+              CAUSAL: tl.constexpr,
+              EVEN_N: tl.constexpr,
+              BLOCK_M: tl.constexpr,
+              BLOCK_N: tl.constexpr):
+    # Heaviest (largest start_m) blocks are dispatched first -> the tail of the
+    # launch consists of the cheap blocks, which shrinks the drain phase.
+    pid = tl.program_id(0)
+    start_m = tl.num_programs(0) - 1 - pid
+
+    off_hz = tl.program_id(1)
+    off_z = off_hz // H
+    off_h = off_hz % H
+
+    Q_base = Q + off_z * stride_qz + off_h * stride_qh
+    K_base = K + off_z * stride_kz + off_h * stride_kh
+    V_base = V + off_z * stride_vz + off_h * stride_vh
+    O_base = Out + off_z * stride_oz + off_h * stride_oh
+
+    offs_m = start_m * BLOCK_M + tl.arange(0, BLOCK_M)
+    offs_n = tl.arange(0, BLOCK_N)
+    offs_d = tl.arange(0, HEAD_DIM)
+
+    if EVEN_N:
+        q = tl.load(Q_base + offs_m[:, None] * stride_qm + offs_d[None, :] * stride_qk)
+    else:
+        q = tl.load(Q_base + offs_m[:, None] * stride_qm + offs_d[None, :] * stride_qk,
+                    mask=(offs_m < N_CTX)[:, None], other=0.0)
+
+    m_i = tl.full([BLOCK_M], -float("inf"), dtype=tl.float32)
+    l_i = tl.zeros([BLOCK_M], dtype=tl.float32)
+    acc = tl.zeros([BLOCK_M, HEAD_DIM], dtype=tl.float32)
+
+    qk_scale = sm_scale * 1.44269504088896340736
+
+    if CAUSAL:
+        acc, l_i, m_i = _attn_fwd_inner(acc, l_i, m_i, q, K_base, V_base,
+                                        stride_kn, stride_kk, stride_vn, stride_vk,
+                                        qk_scale, offs_m, offs_n, offs_d,
+                                        0, start_m * BLOCK_M, N_CTX,
+                                        1, EVEN_N, BLOCK_M, BLOCK_N, HEAD_DIM)
+        acc, l_i, m_i = _attn_fwd_inner(acc, l_i, m_i, q, K_base, V_base,
+                                        stride_kn, stride_kk, stride_vn, stride_vk,
+                                        qk_scale, offs_m, offs_n, offs_d,
+                                        start_m * BLOCK_M, (start_m + 1) * BLOCK_M, N_CTX,
+                                        2, EVEN_N, BLOCK_M, BLOCK_N, HEAD_DIM)
+    else:
+        acc, l_i, m_i = _attn_fwd_inner(acc, l_i, m_i, q, K_base, V_base,
+                                        stride_kn, stride_kk, stride_vn, stride_vk,
+                                        qk_scale, offs_m, offs_n, offs_d,
+                                        0, N_CTX, N_CTX,
+                                        1, EVEN_N, BLOCK_M, BLOCK_N, HEAD_DIM)
+
+    l_safe = tl.where(l_i > 0.0, l_i, 1.0)
+    out = acc / l_safe[:, None]
+    o_ptrs = O_base + offs_m[:, None] * stride_om + offs_d[None, :] * stride_ok
+    if EVEN_N:
+        tl.store(o_ptrs, out.to(Out.dtype.element_ty))
+    else:
+        tl.store(o_ptrs, out.to(Out.dtype.element_ty), mask=(offs_m < N_CTX)[:, None])
+
+
+def kernel_function(q: torch.Tensor,
+                    k: torch.Tensor,
+                    v: torch.Tensor,
+                    is_causal: bool = True,
+                    sm_scale: float | None = None) -> torch.Tensor:
+    """Causal scaled-dot-product attention, fully fused in one Triton kernel."""
+    assert q.is_cuda and k.is_cuda and v.is_cuda, "inputs must be CUDA tensors"
+    assert q.dim() == k.dim() == v.dim() == 4, "expected [Z, H, N, D] tensors"
+    assert q.shape == k.shape == v.shape, "q/k/v must have the same shape"
+    assert q.dtype == k.dtype == v.dtype, "q/k/v must share a dtype"
+
+    Z, H, N_CTX, HEAD_DIM = q.shape
+    assert HEAD_DIM in (16, 32, 64, 128, 256), "unsupported head dim"
+
+    if sm_scale is None:
+        sm_scale = float(HEAD_DIM) ** -0.5
+
+    out = torch.empty_like(q)
+
+    # True when every autotuned BLOCK_M/BLOCK_N (max 128) divides N_CTX, which
+    # lets the inner loop drop all boundary masks and predicated loads.
+    even_n = (N_CTX % 128 == 0)
+
+    grid = lambda META: (triton.cdiv(N_CTX, META["BLOCK_M"]), Z * H, 1)
+
+    _attn_fwd[grid](
+        q, k, v, out,
+        sm_scale,
+        q.stride(0), q.stride(1), q.stride(2), q.stride(3),
+        k.stride(0), k.stride(1), k.stride(2), k.stride(3),
+        v.stride(0), v.stride(1), v.stride(2), v.stride(3),
+        out.stride(0), out.stride(1), out.stride(2), out.stride(3),
+        H, N_CTX,
+        HEAD_DIM=HEAD_DIM,
+        CAUSAL=bool(is_causal),
+        EVEN_N=even_n,
+    )
+    return out

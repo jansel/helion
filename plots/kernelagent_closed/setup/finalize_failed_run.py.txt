@@ -1,0 +1,163 @@
+from __future__ import annotations
+
+import argparse
+import json
+from pathlib import Path
+import time
+from typing import Any
+
+VERSION = "v3-20260730"
+
+
+def _write_json(path: Path, payload: object) -> None:
+    temporary = path.with_suffix(path.suffix + ".tmp")
+    temporary.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n")
+    temporary.replace(path)
+
+
+def _usage_from_history(history_root: Path) -> dict[str, int]:
+    by_message: dict[str, dict[str, int]] = {}
+    anonymous_index = 0
+    for path in history_root.rglob("wire.jsonl"):
+        for line in path.read_text(errors="replace").splitlines():
+            try:
+                record = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            message = record.get("message", {})
+            if message.get("type") != "StatusUpdate":
+                continue
+            payload = message.get("payload", {})
+            usage = payload.get("token_usage")
+            if not isinstance(usage, dict):
+                continue
+            message_id = payload.get("message_id")
+            if not message_id:
+                anonymous_index += 1
+                message_id = f"anonymous-{anonymous_index}"
+            by_message[str(message_id)] = {
+                key: int(value)
+                for key, value in usage.items()
+                if isinstance(value, (int, float))
+            }
+    totals = {
+        "model_calls": len(by_message),
+        "input_other_tokens": 0,
+        "input_cache_creation_tokens": 0,
+        "input_cache_read_tokens": 0,
+        "output_tokens": 0,
+    }
+    keys = {
+        "input_other": "input_other_tokens",
+        "input_cache_creation": "input_cache_creation_tokens",
+        "input_cache_read": "input_cache_read_tokens",
+        "output": "output_tokens",
+    }
+    for usage in by_message.values():
+        for source, target in keys.items():
+            totals[target] += int(usage.get(source, 0))
+    totals["total_tokens"] = sum(
+        totals[key]
+        for key in (
+            "input_other_tokens",
+            "input_cache_creation_tokens",
+            "input_cache_read_tokens",
+            "output_tokens",
+        )
+    )
+    return totals
+
+
+def finalize(args: argparse.Namespace) -> None:
+    run_dir = args.run_dir.resolve()
+    manifest_path = run_dir / "manifest.json"
+    state_path = run_dir / "campaign_state.json"
+    result_path = run_dir / "benchmark_result.json"
+    manifest: dict[str, Any] = json.loads(manifest_path.read_text())
+    state = json.loads(state_path.read_text())
+    if state.get("best_candidate_id") is not None:
+        raise RuntimeError("failed-run finalizer cannot discard a selected candidate")
+
+    deadline = float(manifest["start_time_unix"]) + float(manifest["budget_seconds"])
+    if time.time() < deadline - 1.0:
+        raise RuntimeError("cannot finalize a campaign before its fixed deadline")
+
+    budget_label = str(manifest["budget_label"])
+    failure_reason = (
+        f"No candidate passed both full-output correctness cases in {budget_label}."
+    )
+    elapsed = float(manifest["budget_seconds"])
+    manifest.update(
+        {
+            "status": "FAIL",
+            "elapsed_seconds": elapsed,
+            "submission_count": len(state["submissions"]),
+            "correctness_check_count": len(state.get("correctness_checks", [])),
+            "correctness_pass_count": sum(
+                item.get("status") == "PASS"
+                for item in state.get("correctness_checks", [])
+            ),
+            "verified_submission_count": 0,
+            "failure_reason": failure_reason,
+            "correctness": {
+                "standard_seed": 2026080106,
+                "stress_seed": 2026080107,
+                "stress_qk_scale": 2.0,
+                "stress_value_offset": "random per batch/head/feature",
+                "atol": 5e-2,
+                "rtol": 2e-2,
+                "comparison": "full output against PyTorch cuDNN SDPA",
+            },
+            "token_usage": _usage_from_history(run_dir / "kernelagent-history"),
+            "provider_reported_cost_usd": None,
+            "completed_time_unix": (float(manifest["start_time_unix"]) + elapsed),
+        }
+    )
+    _write_json(manifest_path, manifest)
+    result = {
+        "impl": f"kernelagent-closed-{budget_label}",
+        "version": (
+            f"KernelAgent Closed Binary {VERSION}; GPT-5.6; "
+            f"CUTLASS DSL {manifest['cutlass_dsl_version']}"
+        ),
+        "version_label": f"KernelAgent Closed Binary {VERSION} / GPT-5.6",
+        "shape": {
+            "z": 2,
+            "h": 32,
+            "seq_len": manifest["seq_len"],
+            "head_dim": 64,
+            "dtype": "float16",
+            "causal": int(bool(manifest["causal"])),
+            "biased": 0,
+        },
+        "gpu": "NVIDIA B200",
+        "physical_gpu": str(manifest["physical_gpu"]),
+        "power_cap_w": 750,
+        "flop_model": "softmax_attention_forward",
+        "accuracy": "FAIL",
+        "error": failure_reason,
+        "config": {
+            "budget_label": budget_label,
+            "budget_seconds": manifest["budget_seconds"],
+            "elapsed_seconds": elapsed,
+        },
+        "notes": [
+            (
+                f"The fresh {budget_label} campaign exhausted its fixed wall-clock "
+                "budget without a dual-case-correct candidate; no throughput is "
+                "reported."
+            )
+        ],
+    }
+    _write_json(result_path, result)
+    print(f"Recorded failed {budget_label} run in {run_dir}")
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--run-dir", type=Path, required=True)
+    return parser.parse_args()
+
+
+if __name__ == "__main__":
+    finalize(parse_args())

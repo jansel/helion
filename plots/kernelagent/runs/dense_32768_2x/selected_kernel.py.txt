@@ -1,0 +1,334 @@
+from __future__ import annotations
+
+import math
+
+import torch
+import triton
+import triton.language as tl
+
+# Must be *instantiated* as constexpr to be readable inside @triton.jit code.
+LOG2E = tl.constexpr(1.4426950408889634)
+
+
+# --------------------------------------------------------------------------- #
+#  Fused online-softmax attention step for one K/V tile.
+#  Stages fused here: QK^T (tl.dot) -> scale -> running max -> exp2 ->
+#  running sum -> accumulator rescale -> P@V (tl.dot).
+# --------------------------------------------------------------------------- #
+@triton.jit
+def _attn_step(acc, l_i, m_i, q, kT, v, qk_scale, n_valid, EVEN_N: tl.constexpr):
+    qk = tl.dot(q, kT) * qk_scale
+    if EVEN_N:
+        m_ij = tl.maximum(m_i, tl.max(qk, 1))
+    else:
+        qk = tl.where(n_valid[None, :], qk, -1.0e6)
+        m_ij = tl.maximum(m_i, tl.max(qk, 1))
+    p = tl.math.exp2(qk - m_ij[:, None])
+    alpha = tl.math.exp2(m_i - m_ij)
+    l_i = l_i * alpha + tl.sum(p, 1)
+    acc = acc * alpha[:, None]
+    acc = tl.dot(p.to(v.dtype), v, acc)
+    return acc, l_i, m_ij
+
+
+# --------------------------------------------------------------------------- #
+#  TMA (device-side descriptors) -- warp specialized inner loop
+# --------------------------------------------------------------------------- #
+@triton.jit
+def _attn_fwd_tma_ws(
+    Q, K, V, O, sm_scale, Y_DIM, N_CTX,
+    HEAD_DIM: tl.constexpr,
+    BLOCK_M: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+):
+    start_m = tl.program_id(0)
+    off_hz = tl.program_id(1)
+    y_off = off_hz * N_CTX
+
+    desc_q = tl.make_tensor_descriptor(
+        Q, shape=[Y_DIM, HEAD_DIM], strides=[HEAD_DIM, 1],
+        block_shape=[BLOCK_M, HEAD_DIM])
+    desc_k = tl.make_tensor_descriptor(
+        K, shape=[Y_DIM, HEAD_DIM], strides=[HEAD_DIM, 1],
+        block_shape=[BLOCK_N, HEAD_DIM])
+    desc_v = tl.make_tensor_descriptor(
+        V, shape=[Y_DIM, HEAD_DIM], strides=[HEAD_DIM, 1],
+        block_shape=[BLOCK_N, HEAD_DIM])
+    desc_o = tl.make_tensor_descriptor(
+        O, shape=[Y_DIM, HEAD_DIM], strides=[HEAD_DIM, 1],
+        block_shape=[BLOCK_M, HEAD_DIM])
+
+    qo_y = y_off + start_m * BLOCK_M
+    q = desc_q.load([qo_y, 0])
+
+    m_i = tl.full([BLOCK_M], -float("inf"), dtype=tl.float32)
+    l_i = tl.zeros([BLOCK_M], dtype=tl.float32)
+    acc = tl.zeros([BLOCK_M, HEAD_DIM], dtype=tl.float32)
+
+    qk_scale = sm_scale * LOG2E
+    n_valid = tl.arange(0, BLOCK_N) >= 0  # all-true (EVEN_N path only)
+
+    for start_n in tl.range(0, N_CTX, BLOCK_N, warp_specialize=True):
+        k = desc_k.load([y_off + start_n, 0])
+        v = desc_v.load([y_off + start_n, 0])
+        acc, l_i, m_i = _attn_step(
+            acc, l_i, m_i, q, tl.trans(k), v, qk_scale, n_valid, True)
+
+    acc = acc / l_i[:, None]
+    desc_o.store([qo_y, 0], acc.to(O.dtype.element_ty))
+
+
+# --------------------------------------------------------------------------- #
+#  TMA (device-side descriptors) -- plain software-pipelined loop
+# --------------------------------------------------------------------------- #
+@triton.jit
+def _attn_fwd_tma(
+    Q, K, V, O, sm_scale, Y_DIM, N_CTX,
+    HEAD_DIM: tl.constexpr,
+    BLOCK_M: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+):
+    start_m = tl.program_id(0)
+    off_hz = tl.program_id(1)
+    y_off = off_hz * N_CTX
+
+    desc_q = tl.make_tensor_descriptor(
+        Q, shape=[Y_DIM, HEAD_DIM], strides=[HEAD_DIM, 1],
+        block_shape=[BLOCK_M, HEAD_DIM])
+    desc_k = tl.make_tensor_descriptor(
+        K, shape=[Y_DIM, HEAD_DIM], strides=[HEAD_DIM, 1],
+        block_shape=[BLOCK_N, HEAD_DIM])
+    desc_v = tl.make_tensor_descriptor(
+        V, shape=[Y_DIM, HEAD_DIM], strides=[HEAD_DIM, 1],
+        block_shape=[BLOCK_N, HEAD_DIM])
+    desc_o = tl.make_tensor_descriptor(
+        O, shape=[Y_DIM, HEAD_DIM], strides=[HEAD_DIM, 1],
+        block_shape=[BLOCK_M, HEAD_DIM])
+
+    qo_y = y_off + start_m * BLOCK_M
+    q = desc_q.load([qo_y, 0])
+
+    m_i = tl.full([BLOCK_M], -float("inf"), dtype=tl.float32)
+    l_i = tl.zeros([BLOCK_M], dtype=tl.float32)
+    acc = tl.zeros([BLOCK_M, HEAD_DIM], dtype=tl.float32)
+
+    qk_scale = sm_scale * LOG2E
+    n_valid = tl.arange(0, BLOCK_N) >= 0
+
+    for start_n in tl.range(0, N_CTX, BLOCK_N):
+        k = desc_k.load([y_off + start_n, 0])
+        v = desc_v.load([y_off + start_n, 0])
+        acc, l_i, m_i = _attn_step(
+            acc, l_i, m_i, q, tl.trans(k), v, qk_scale, n_valid, True)
+
+    acc = acc / l_i[:, None]
+    desc_o.store([qo_y, 0], acc.to(O.dtype.element_ty))
+
+
+# --------------------------------------------------------------------------- #
+#  Classic pointer-based kernel (universal fallback, arbitrary strides/shapes)
+# --------------------------------------------------------------------------- #
+@triton.jit
+def _attn_fwd_classic(
+    Q, K, V, O, sm_scale,
+    stride_qz, stride_qh, stride_qm, stride_qd,
+    stride_kz, stride_kh, stride_kn, stride_kd,
+    stride_vz, stride_vh, stride_vn, stride_vd,
+    stride_oz, stride_oh, stride_om, stride_od,
+    H, N_CTX,
+    HEAD_DIM: tl.constexpr,
+    BLOCK_M: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    EVEN_M: tl.constexpr,
+    EVEN_N: tl.constexpr,
+):
+    start_m = tl.program_id(0)
+    off_hz = tl.program_id(1)
+    off_z = off_hz // H
+    off_h = off_hz % H
+
+    q_base = Q + off_z * stride_qz + off_h * stride_qh
+    k_base = K + off_z * stride_kz + off_h * stride_kh
+    v_base = V + off_z * stride_vz + off_h * stride_vh
+    o_base = O + off_z * stride_oz + off_h * stride_oh
+
+    offs_m = start_m * BLOCK_M + tl.arange(0, BLOCK_M)
+    offs_n = tl.arange(0, BLOCK_N)
+    offs_d = tl.arange(0, HEAD_DIM)
+    m_mask = offs_m < N_CTX
+
+    q_ptrs = q_base + offs_m[:, None] * stride_qm + offs_d[None, :] * stride_qd
+    if EVEN_M:
+        q = tl.load(q_ptrs)
+    else:
+        q = tl.load(q_ptrs, mask=m_mask[:, None], other=0.0)
+
+    m_i = tl.full([BLOCK_M], -float("inf"), dtype=tl.float32)
+    l_i = tl.zeros([BLOCK_M], dtype=tl.float32)
+    acc = tl.zeros([BLOCK_M, HEAD_DIM], dtype=tl.float32)
+
+    qk_scale = sm_scale * LOG2E
+
+    # K/V are streamed as coalesced [BLOCK_N, HEAD_DIM] tiles; K is transposed
+    # in-register for the tl.dot.
+    k_ptrs = k_base + offs_n[:, None] * stride_kn + offs_d[None, :] * stride_kd
+    v_ptrs = v_base + offs_n[:, None] * stride_vn + offs_d[None, :] * stride_vd
+
+    for start_n in tl.range(0, N_CTX, BLOCK_N):
+        start_n = tl.multiple_of(start_n, BLOCK_N)
+        n_valid = (start_n + offs_n) < N_CTX
+        if EVEN_N:
+            k = tl.load(k_ptrs)
+            v = tl.load(v_ptrs)
+        else:
+            k = tl.load(k_ptrs, mask=n_valid[:, None], other=0.0)
+            v = tl.load(v_ptrs, mask=n_valid[:, None], other=0.0)
+
+        acc, l_i, m_i = _attn_step(
+            acc, l_i, m_i, q, tl.trans(k), v, qk_scale, n_valid, EVEN_N)
+
+        k_ptrs += BLOCK_N * stride_kn
+        v_ptrs += BLOCK_N * stride_vn
+
+    acc = acc / l_i[:, None]
+    o_ptrs = o_base + offs_m[:, None] * stride_om + offs_d[None, :] * stride_od
+    if EVEN_M:
+        tl.store(o_ptrs, acc.to(O.dtype.element_ty))
+    else:
+        tl.store(o_ptrs, acc.to(O.dtype.element_ty), mask=m_mask[:, None])
+
+
+# --------------------------------------------------------------------------- #
+#  Launch helpers / variant selection (allocation + launch config only)
+# --------------------------------------------------------------------------- #
+_ALLOC_STATE = {"ok": None}
+_CACHE = {}
+
+
+def _ensure_allocator() -> bool:
+    if _ALLOC_STATE["ok"] is None:
+        try:
+            def _alloc(size, alignment, stream):
+                return torch.empty(size, device="cuda", dtype=torch.int8)
+
+            triton.set_allocator(_alloc)
+            _ALLOC_STATE["ok"] = hasattr(tl, "make_tensor_descriptor")
+        except Exception:
+            _ALLOC_STATE["ok"] = False
+    return bool(_ALLOC_STATE["ok"])
+
+
+def _make_classic(BM, BN, W, S):
+    def run(q, k, v, out, sm_scale, Z, H, N, D):
+        grid = (triton.cdiv(N, BM), Z * H, 1)
+        _attn_fwd_classic[grid](
+            q, k, v, out, sm_scale,
+            q.stride(0), q.stride(1), q.stride(2), q.stride(3),
+            k.stride(0), k.stride(1), k.stride(2), k.stride(3),
+            v.stride(0), v.stride(1), v.stride(2), v.stride(3),
+            out.stride(0), out.stride(1), out.stride(2), out.stride(3),
+            H, N,
+            HEAD_DIM=D, BLOCK_M=BM, BLOCK_N=BN,
+            EVEN_M=(N % BM == 0), EVEN_N=(N % BN == 0),
+            num_warps=W, num_stages=S,
+        )
+
+    return run
+
+
+def _make_tma(BM, BN, W, S, ws):
+    kern = _attn_fwd_tma_ws if ws else _attn_fwd_tma
+
+    def run(q, k, v, out, sm_scale, Z, H, N, D):
+        grid = (N // BM, Z * H, 1)
+        kern[grid](
+            q, k, v, out, sm_scale, Z * H * N, N,
+            HEAD_DIM=D, BLOCK_M=BM, BLOCK_N=BN,
+            num_warps=W, num_stages=S,
+        )
+
+    return run
+
+
+def _candidate_list(q, k, v, N, D):
+    cands = []
+    tma_ok = (
+        q.is_contiguous() and k.is_contiguous() and v.is_contiguous()
+        and q.dtype in (torch.float16, torch.bfloat16)
+        and D in (32, 64, 128)
+        and _ensure_allocator()
+    )
+    if tma_ok:
+        for (BM, BN, W, S, WS) in (
+            (128, 128, 4, 2, True),
+            (128, 64, 4, 3, True),
+            (128, 128, 8, 3, False),
+            (128, 64, 8, 4, False),
+        ):
+            if N % BM == 0 and N % BN == 0:
+                cands.append(_make_tma(BM, BN, W, S, WS))
+
+    for (BM, BN, W, S) in (
+        (128, 64, 8, 3),
+        (128, 128, 8, 3),
+        (64, 64, 4, 4),
+    ):
+        cands.append(_make_classic(BM, BN, W, S))
+    return cands
+
+
+def _select(q, k, v, sm_scale, Z, H, N, D):
+    scratch = torch.empty_like(q)
+    best, best_t = None, float("inf")
+    for cand in _candidate_list(q, k, v, N, D):
+        try:
+            cand(q, k, v, scratch, sm_scale, Z, H, N, D)
+            torch.cuda.synchronize()
+            ev0 = torch.cuda.Event(enable_timing=True)
+            ev1 = torch.cuda.Event(enable_timing=True)
+            ev0.record()
+            for _ in range(2):
+                cand(q, k, v, scratch, sm_scale, Z, H, N, D)
+            ev1.record()
+            torch.cuda.synchronize()
+            t = ev0.elapsed_time(ev1) / 2.0
+        except Exception:
+            continue
+        if t < best_t:
+            best, best_t = cand, t
+    if best is None:
+        best = _make_classic(64, 64, 4, 3)
+    del scratch
+    return best
+
+
+def kernel_function(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor) -> torch.Tensor:
+    """Non-causal fused scaled-dot-product attention (FlashAttention forward).
+
+    Everything (QK^T, scaling, streaming softmax, P@V, normalization and the
+    fp16 cast) is fused into a single Triton kernel launch; no intermediate
+    attention-score tensor is written to global memory.  The wrapper only
+    validates arguments, allocates the output and picks a launch config.
+    """
+    assert q.is_cuda and k.is_cuda and v.is_cuda, "inputs must live on CUDA"
+    assert q.dim() == k.dim() == v.dim() == 4, "expected 4-D [Z, H, N, D] tensors"
+    assert q.shape == k.shape == v.shape, "q/k/v must have identical shapes"
+    assert q.dtype == k.dtype == v.dtype, "q/k/v must share a dtype"
+
+    Z, H, N_CTX, HEAD_DIM = q.shape
+    assert HEAD_DIM in (16, 32, 64, 128, 256), f"unsupported head_dim {HEAD_DIM}"
+
+    out = torch.empty_like(q)
+    sm_scale = 1.0 / math.sqrt(HEAD_DIM)
+
+    key = (
+        tuple(q.shape), q.dtype, q.stride(), k.stride(), v.stride(),
+        q.device.index,
+    )
+    fn = _CACHE.get(key)
+    if fn is None:
+        fn = _select(q, k, v, sm_scale, Z, H, N_CTX, HEAD_DIM)
+        _CACHE[key] = fn
+
+    fn(q, k, v, out, sm_scale, Z, H, N_CTX, HEAD_DIM)
+    return out

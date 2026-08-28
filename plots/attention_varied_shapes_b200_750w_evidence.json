@@ -1,0 +1,1228 @@
+{
+  "description": "Compact raw timing evidence for attention_varied_shapes_b200_750w.csv. Each TFLOP/s value is flop_count / median(runs_ms) / 1e9.",
+  "hardware": {
+    "gpu": "NVIDIA B200",
+    "power_cap_w": 750
+  },
+  "helion_version_scope": "The Helion dev+hash names the consolidated landable stack. Exact measurement commits varied by shape; the original source audit files are not included in this tracked archive.",
+  "implementation_versions": {
+    "fa4": "fa4-v4.0.0.beta23; CuTe 4.6.1",
+    "flexattention-cute": "PyTorch 2.13.0.dev20260506; FA4 fa4-v4.0.0.beta23; CuTe 4.6.1",
+    "helion-cute": "Helion 1.4.0.dev95+ge094f171; CuTe 4.6.1",
+    "sdpa": "PyTorch 2.13.0.dev20260506; cuDNN 9.20.0.48"
+  },
+  "measurements": [
+    {
+      "correctness": "PASS",
+      "dtype": "bfloat16",
+      "epilogue": null,
+      "flop_count": 2251799813685248,
+      "flop_model": "QK+PV; causal uses one-half dense work; ReLU excluded",
+      "gpu": "NVIDIA B200",
+      "implementation": "helion-cute",
+      "median_ms": 1984.748779296875,
+      "median_tflops": 1134.5515549242357,
+      "physical_gpu": 7,
+      "power_cap_recorded": "yes",
+      "power_cap_w": 750,
+      "runs_ms": [
+        1975.9150390625,
+        1988.0062255859375,
+        1984.8673095703125,
+        1986.45166015625,
+        1981.066650390625,
+        1980.4530029296875,
+        1980.640380859375,
+        1996.8653564453125,
+        1985.81103515625,
+        1976.0535888671875,
+        2008.3614501953125,
+        1984.6302490234375
+      ],
+      "shape_bhsd": [
+        2,
+        32,
+        262144,
+        128
+      ],
+      "shape_order": 1,
+      "source_artifact": "bf16-d128-dense262144-rank0-self-contained-audit-gpu7.jsonl",
+      "timing_mode": "randomized_paired",
+      "variant": "dense"
+    },
+    {
+      "correctness": "PASS",
+      "dtype": "bfloat16",
+      "epilogue": null,
+      "flop_count": 2251799813685248,
+      "flop_model": "QK+PV; causal uses one-half dense work; ReLU excluded",
+      "gpu": "NVIDIA B200",
+      "implementation": "sdpa",
+      "median_ms": 2053.6744384765625,
+      "median_tflops": 1096.4736043341206,
+      "physical_gpu": 7,
+      "power_cap_recorded": "yes",
+      "power_cap_w": 750,
+      "runs_ms": [
+        2051.063720703125,
+        2070.09423828125,
+        2044.7232666015625,
+        2043.9688720703125,
+        2063.83544921875,
+        2034.962158203125,
+        2073.6142578125,
+        2047.0533447265625,
+        2040.3599853515625,
+        2061.842529296875,
+        2070.62939453125,
+        2056.28515625
+      ],
+      "shape_bhsd": [
+        2,
+        32,
+        262144,
+        128
+      ],
+      "shape_order": 1,
+      "source_artifact": "bf16-d128-dense262144-rank0-self-contained-audit-gpu7.jsonl",
+      "timing_mode": "randomized_paired",
+      "variant": "dense"
+    },
+    {
+      "correctness": "PASS",
+      "dtype": "bfloat16",
+      "epilogue": null,
+      "flop_count": 2251799813685248,
+      "flop_model": "QK+PV; causal uses one-half dense work; ReLU excluded",
+      "gpu": "NVIDIA B200",
+      "implementation": "fa4",
+      "median_ms": 2771.8226318359375,
+      "median_tflops": 812.3895763827253,
+      "physical_gpu": 7,
+      "power_cap_recorded": "yes",
+      "power_cap_w": 750,
+      "runs_ms": [
+        2740.7021484375,
+        2756.431640625,
+        2751.278564453125,
+        2771.54248046875,
+        2788.585205078125,
+        2772.204345703125,
+        2781.332763671875,
+        2791.921630859375,
+        2772.102783203125,
+        2770.715087890625,
+        2790.035400390625,
+        2759.43115234375
+      ],
+      "shape_bhsd": [
+        2,
+        32,
+        262144,
+        128
+      ],
+      "shape_order": 1,
+      "source_artifact": "bf16-d128-dense262144-rank0-self-contained-audit-gpu7.jsonl",
+      "timing_mode": "randomized_paired",
+      "variant": "dense"
+    },
+    {
+      "correctness": "PASS",
+      "dtype": "bfloat16",
+      "epilogue": null,
+      "flop_count": 2251799813685248,
+      "flop_model": "QK+PV; causal uses one-half dense work; ReLU excluded",
+      "gpu": "NVIDIA B200",
+      "implementation": "flexattention-cute",
+      "median_ms": 2976.62353515625,
+      "median_tflops": 756.4946615148783,
+      "physical_gpu": 6,
+      "power_cap_recorded": "yes",
+      "power_cap_w": 750,
+      "runs_ms": [
+        2972.796142578125,
+        2976.62353515625,
+        2978.270263671875,
+        2974.877685546875,
+        2983.13623046875,
+        2982.95703125,
+        2977.594482421875,
+        2968.925048828125,
+        2976.238525390625
+      ],
+      "shape_bhsd": [
+        2,
+        32,
+        262144,
+        128
+      ],
+      "shape_order": 1,
+      "source_artifact": "d128_dense262_fa4_flex_20260814.json",
+      "timing_mode": "standalone_screen",
+      "variant": "dense"
+    },
+    {
+      "correctness": "PASS",
+      "dtype": "bfloat16",
+      "epilogue": null,
+      "flop_count": 4503599627370496,
+      "flop_model": "QK+PV; causal uses one-half dense work; ReLU excluded",
+      "gpu": "NVIDIA B200",
+      "implementation": "helion-cute",
+      "median_ms": 3918.87255859375,
+      "median_tflops": 1149.207982661873,
+      "physical_gpu": 7,
+      "power_cap_recorded": "yes",
+      "power_cap_w": 750,
+      "runs_ms": [
+        3919.080322265625,
+        3917.296875,
+        3918.83251953125,
+        3927.606689453125,
+        3918.822998046875,
+        3917.039794921875,
+        3917.38671875,
+        3918.91259765625,
+        3923.810302734375,
+        3917.926025390625,
+        3922.934814453125,
+        3919.327880859375
+      ],
+      "shape_bhsd": [
+        2,
+        32,
+        524288,
+        128
+      ],
+      "shape_order": 2,
+      "source_artifact": "bf16-d128-causal524288-rank0-self-contained-audit-gpu7.jsonl",
+      "timing_mode": "randomized_paired",
+      "variant": "causal"
+    },
+    {
+      "correctness": "PASS",
+      "dtype": "bfloat16",
+      "epilogue": null,
+      "flop_count": 4503599627370496,
+      "flop_model": "QK+PV; causal uses one-half dense work; ReLU excluded",
+      "gpu": "NVIDIA B200",
+      "implementation": "sdpa",
+      "median_ms": 4357.3896484375,
+      "median_tflops": 1033.5544880603975,
+      "physical_gpu": 7,
+      "power_cap_recorded": "yes",
+      "power_cap_w": 750,
+      "runs_ms": [
+        4358.29638671875,
+        4357.296875,
+        4359.59765625,
+        4351.8876953125,
+        4357.69384765625,
+        4352.806640625,
+        4348.78564453125,
+        4365.85107421875,
+        4352.73486328125,
+        4362.82666015625,
+        4353.38525390625,
+        4357.482421875
+      ],
+      "shape_bhsd": [
+        2,
+        32,
+        524288,
+        128
+      ],
+      "shape_order": 2,
+      "source_artifact": "bf16-d128-causal524288-rank0-self-contained-audit-gpu7.jsonl",
+      "timing_mode": "randomized_paired",
+      "variant": "causal"
+    },
+    {
+      "correctness": "PASS",
+      "dtype": "bfloat16",
+      "epilogue": null,
+      "flop_count": 4503599627370496,
+      "flop_model": "QK+PV; causal uses one-half dense work; ReLU excluded",
+      "gpu": "NVIDIA B200",
+      "implementation": "fa4",
+      "median_ms": 3946.48046875,
+      "median_tflops": 1141.1686091017084,
+      "physical_gpu": 7,
+      "power_cap_recorded": "yes",
+      "power_cap_w": 750,
+      "runs_ms": [
+        3944.49658203125,
+        3946.484619140625,
+        3948.744384765625,
+        3946.846923828125,
+        3946.476318359375,
+        3950.044921875,
+        3947.18505859375,
+        3942.27783203125,
+        3944.69140625,
+        3944.609130859375,
+        3944.56201171875,
+        3947.992919921875
+      ],
+      "shape_bhsd": [
+        2,
+        32,
+        524288,
+        128
+      ],
+      "shape_order": 2,
+      "source_artifact": "bf16-d128-causal524288-rank0-self-contained-audit-gpu7.jsonl",
+      "timing_mode": "randomized_paired",
+      "variant": "causal"
+    },
+    {
+      "correctness": "PASS",
+      "dtype": "bfloat16",
+      "epilogue": null,
+      "flop_count": 4503599627370496,
+      "flop_model": "QK+PV; causal uses one-half dense work; ReLU excluded",
+      "gpu": "NVIDIA B200",
+      "implementation": "flexattention-cute",
+      "median_ms": 5119.0107421875,
+      "median_tflops": 879.7792882626339,
+      "physical_gpu": 7,
+      "power_cap_recorded": "yes",
+      "power_cap_w": 750,
+      "runs_ms": [
+        5119.0107421875,
+        5132.0751953125,
+        5116.28271484375,
+        5119.5966796875,
+        5092.0419921875
+      ],
+      "shape_bhsd": [
+        2,
+        32,
+        524288,
+        128
+      ],
+      "shape_order": 2,
+      "source_artifact": "d128_causal524_fa4_flex_20260814.json",
+      "timing_mode": "standalone_screen",
+      "variant": "causal"
+    },
+    {
+      "correctness": "PASS",
+      "dtype": "bfloat16",
+      "epilogue": null,
+      "flop_count": 2251799813685248,
+      "flop_model": "QK+PV; causal uses one-half dense work; ReLU excluded",
+      "gpu": "NVIDIA B200",
+      "implementation": "helion-cute",
+      "median_ms": 2867.2177734375,
+      "median_tflops": 785.3605800530355,
+      "physical_gpu": 7,
+      "power_cap_recorded": "campaign",
+      "power_cap_w": 750,
+      "runs_ms": [
+        2859.44287109375,
+        2864.089111328125,
+        2860.327392578125,
+        2863.51806640625,
+        2866.029296875,
+        2868.03759765625,
+        2870.390625,
+        2869.624755859375,
+        2867.13671875,
+        2871.212890625,
+        2867.298828125,
+        2867.90283203125
+      ],
+      "shape_bhsd": [
+        1,
+        32,
+        524288,
+        64
+      ],
+      "shape_order": 3,
+      "source_artifact": "bf16_b1_dense_winner_12pair_gpu7_20260814.jsonl",
+      "timing_mode": "randomized_paired",
+      "variant": "dense"
+    },
+    {
+      "correctness": "PASS",
+      "dtype": "bfloat16",
+      "epilogue": null,
+      "flop_count": 2251799813685248,
+      "flop_model": "QK+PV; causal uses one-half dense work; ReLU excluded",
+      "gpu": "NVIDIA B200",
+      "implementation": "sdpa",
+      "median_ms": 2872.85546875,
+      "median_tflops": 783.8193874281543,
+      "physical_gpu": 7,
+      "power_cap_recorded": "campaign",
+      "power_cap_w": 750,
+      "runs_ms": [
+        2866.276123046875,
+        2868.43017578125,
+        2868.648681640625,
+        2871.689697265625,
+        2875.15380859375,
+        2872.240966796875,
+        2873.469970703125,
+        2861.662841796875,
+        2875.194580078125,
+        2882.593994140625,
+        2875.857666015625,
+        2875.236083984375
+      ],
+      "shape_bhsd": [
+        1,
+        32,
+        524288,
+        64
+      ],
+      "shape_order": 3,
+      "source_artifact": "bf16_b1_dense_winner_12pair_gpu7_20260814.jsonl",
+      "timing_mode": "randomized_paired",
+      "variant": "dense"
+    },
+    {
+      "correctness": "PASS",
+      "dtype": "bfloat16",
+      "epilogue": null,
+      "flop_count": 2251799813685248,
+      "flop_model": "QK+PV; causal uses one-half dense work; ReLU excluded",
+      "gpu": "NVIDIA B200",
+      "implementation": "fa4",
+      "median_ms": 3577.232421875,
+      "median_tflops": 629.4809920415994,
+      "physical_gpu": 7,
+      "power_cap_recorded": "yes",
+      "power_cap_w": 750,
+      "runs_ms": [
+        3577.232421875,
+        3581.286376953125,
+        3583.531005859375,
+        3572.937744140625,
+        3564.31884765625
+      ],
+      "shape_bhsd": [
+        1,
+        32,
+        524288,
+        64
+      ],
+      "shape_order": 3,
+      "source_artifact": "bf16_b1_dense524_baselines_gpu7_20260814.json",
+      "timing_mode": "standalone_screen",
+      "variant": "dense"
+    },
+    {
+      "correctness": "PASS",
+      "dtype": "bfloat16",
+      "epilogue": null,
+      "flop_count": 2251799813685248,
+      "flop_model": "QK+PV; causal uses one-half dense work; ReLU excluded",
+      "gpu": "NVIDIA B200",
+      "implementation": "flexattention-cute",
+      "median_ms": 3027.929931640625,
+      "median_tflops": 743.6763282250571,
+      "physical_gpu": 7,
+      "power_cap_recorded": "yes",
+      "power_cap_w": 750,
+      "runs_ms": [
+        3027.929931640625,
+        3030.380615234375,
+        3029.350341796875,
+        3027.061767578125,
+        3023.277099609375
+      ],
+      "shape_bhsd": [
+        1,
+        32,
+        524288,
+        64
+      ],
+      "shape_order": 3,
+      "source_artifact": "bf16_b1_dense524_baselines_gpu7_20260814.json",
+      "timing_mode": "standalone_screen",
+      "variant": "dense"
+    },
+    {
+      "correctness": "PASS",
+      "dtype": "bfloat16",
+      "epilogue": null,
+      "flop_count": 4503599627370496,
+      "flop_model": "QK+PV; causal uses one-half dense work; ReLU excluded",
+      "gpu": "NVIDIA B200",
+      "implementation": "helion-cute",
+      "median_ms": 5926.487060546875,
+      "median_tflops": 759.910480080407,
+      "physical_gpu": 7,
+      "power_cap_recorded": "campaign",
+      "power_cap_w": 750,
+      "runs_ms": [
+        5923.27734375,
+        5929.2822265625,
+        5928.09228515625,
+        5926.91796875,
+        5932.60107421875,
+        5929.87646484375,
+        5915.65673828125,
+        5922.74560546875,
+        5920.59716796875,
+        5921.5478515625,
+        5926.05615234375,
+        5928.615234375
+      ],
+      "shape_bhsd": [
+        1,
+        32,
+        1048576,
+        64
+      ],
+      "shape_order": 4,
+      "source_artifact": "bf16_b1_causal1048576_promoted_vs_fullwinner_vs_fa4_12round_gpu7_20260814.jsonl",
+      "timing_mode": "randomized_paired",
+      "variant": "causal"
+    },
+    {
+      "correctness": "PASS",
+      "dtype": "bfloat16",
+      "epilogue": null,
+      "flop_count": 4503599627370496,
+      "flop_model": "QK+PV; causal uses one-half dense work; ReLU excluded",
+      "gpu": "NVIDIA B200",
+      "implementation": "sdpa",
+      "median_ms": 6061.974609375,
+      "median_tflops": 742.9261779496013,
+      "physical_gpu": 6,
+      "power_cap_recorded": "yes",
+      "power_cap_w": 750,
+      "runs_ms": [
+        6059.34375,
+        6061.974609375,
+        6069.42626953125
+      ],
+      "shape_bhsd": [
+        1,
+        32,
+        1048576,
+        64
+      ],
+      "shape_order": 4,
+      "source_artifact": "bf16_b1_causal1048576_baselines_gpu6_20260814.json",
+      "timing_mode": "standalone_screen",
+      "variant": "causal"
+    },
+    {
+      "correctness": "PASS",
+      "dtype": "bfloat16",
+      "epilogue": null,
+      "flop_count": 4503599627370496,
+      "flop_model": "QK+PV; causal uses one-half dense work; ReLU excluded",
+      "gpu": "NVIDIA B200",
+      "implementation": "fa4",
+      "median_ms": 6014.64013671875,
+      "median_tflops": 748.7729149207931,
+      "physical_gpu": 7,
+      "power_cap_recorded": "campaign",
+      "power_cap_w": 750,
+      "runs_ms": [
+        5993.9951171875,
+        5993.263671875,
+        6006.89404296875,
+        6018.380859375,
+        6018.1142578125,
+        6024.70849609375,
+        6015.71728515625,
+        6010.93212890625,
+        6013.90478515625,
+        6011.6474609375,
+        6015.37548828125,
+        6021.17822265625
+      ],
+      "shape_bhsd": [
+        1,
+        32,
+        1048576,
+        64
+      ],
+      "shape_order": 4,
+      "source_artifact": "bf16_b1_causal1048576_promoted_vs_fullwinner_vs_fa4_12round_gpu7_20260814.jsonl",
+      "timing_mode": "randomized_paired",
+      "variant": "causal"
+    },
+    {
+      "correctness": "PASS",
+      "dtype": "bfloat16",
+      "epilogue": null,
+      "flop_count": 4503599627370496,
+      "flop_model": "QK+PV; causal uses one-half dense work; ReLU excluded",
+      "gpu": "NVIDIA B200",
+      "implementation": "flexattention-cute",
+      "median_ms": 6763.091796875,
+      "median_tflops": 665.908398500736,
+      "physical_gpu": 6,
+      "power_cap_recorded": "yes",
+      "power_cap_w": 750,
+      "runs_ms": [
+        6790.6748046875,
+        6763.091796875,
+        6761.48828125
+      ],
+      "shape_bhsd": [
+        1,
+        32,
+        1048576,
+        64
+      ],
+      "shape_order": 4,
+      "source_artifact": "bf16_b1_causal1048576_fa4flex_gpu6_20260814.json",
+      "timing_mode": "standalone_screen",
+      "variant": "causal"
+    },
+    {
+      "correctness": "PASS",
+      "dtype": "bfloat16",
+      "epilogue": null,
+      "flop_count": 18014398509481984,
+      "flop_model": "QK+PV; causal uses one-half dense work; ReLU excluded",
+      "gpu": "NVIDIA B200",
+      "implementation": "helion-cute",
+      "median_ms": 22858.0087890625,
+      "median_tflops": 788.1000779955001,
+      "physical_gpu": 7,
+      "power_cap_recorded": "campaign",
+      "power_cap_w": 750,
+      "runs_ms": [
+        22850.76171875,
+        22857.625,
+        22860.37109375,
+        22858.392578125,
+        22864.58203125,
+        22858.587890625,
+        22850.841796875,
+        22856.291015625,
+        22856.0390625,
+        22867.712890625,
+        22854.423828125,
+        22860.771484375
+      ],
+      "shape_bhsd": [
+        8,
+        32,
+        524288,
+        64
+      ],
+      "shape_order": 5,
+      "source_artifact": "bf16_b8_dense524288_rank0_vs_sdpa_12pair_gpu7_20260813.jsonl",
+      "timing_mode": "randomized_paired",
+      "variant": "dense"
+    },
+    {
+      "correctness": "PASS",
+      "dtype": "bfloat16",
+      "epilogue": null,
+      "flop_count": 18014398509481984,
+      "flop_model": "QK+PV; causal uses one-half dense work; ReLU excluded",
+      "gpu": "NVIDIA B200",
+      "implementation": "sdpa",
+      "median_ms": 23678.6484375,
+      "median_tflops": 760.7866030458262,
+      "physical_gpu": 7,
+      "power_cap_recorded": "campaign",
+      "power_cap_w": 750,
+      "runs_ms": [
+        23651.50390625,
+        23739.509765625,
+        23710.140625,
+        23675.56640625,
+        23707.205078125,
+        23668.279296875,
+        23681.126953125,
+        23670.568359375,
+        23708.525390625,
+        23633.65625,
+        23695.630859375,
+        23676.169921875
+      ],
+      "shape_bhsd": [
+        8,
+        32,
+        524288,
+        64
+      ],
+      "shape_order": 5,
+      "source_artifact": "bf16_b8_dense524288_rank0_vs_sdpa_12pair_gpu7_20260813.jsonl",
+      "timing_mode": "randomized_paired",
+      "variant": "dense"
+    },
+    {
+      "correctness": "PASS",
+      "dtype": "bfloat16",
+      "epilogue": null,
+      "flop_count": 18014398509481984,
+      "flop_model": "QK+PV; causal uses one-half dense work; ReLU excluded",
+      "gpu": "NVIDIA B200",
+      "implementation": "fa4",
+      "median_ms": 28726.705078125,
+      "median_tflops": 627.0958837948912,
+      "physical_gpu": 6,
+      "power_cap_recorded": "yes",
+      "power_cap_w": 750,
+      "runs_ms": [
+        28650.58203125,
+        28726.705078125,
+        28762.68359375
+      ],
+      "shape_bhsd": [
+        8,
+        32,
+        524288,
+        64
+      ],
+      "shape_order": 5,
+      "source_artifact": "bf16_b8_dense524288_fa4_gpu6_20260814.json",
+      "timing_mode": "standalone_screen",
+      "variant": "dense"
+    },
+    {
+      "correctness": "SKIPPED_FULL_SHAPE_MEMORY",
+      "dtype": "bfloat16",
+      "epilogue": null,
+      "flop_count": 18014398509481984,
+      "flop_model": "QK+PV; causal uses one-half dense work; ReLU excluded",
+      "gpu": "NVIDIA B200",
+      "implementation": "flexattention-cute",
+      "median_ms": 24437.5859375,
+      "median_tflops": 737.1594950317291,
+      "physical_gpu": 6,
+      "power_cap_recorded": "yes",
+      "power_cap_w": 750,
+      "runs_ms": [
+        24357.30078125,
+        24417.802734375,
+        24437.5859375,
+        24445.490234375,
+        24442.921875
+      ],
+      "shape_bhsd": [
+        8,
+        32,
+        524288,
+        64
+      ],
+      "shape_order": 5,
+      "source_artifact": "bf16_b8_dense524288_flex_cute_direct_gpu6_20260814.json",
+      "timing_mode": "standalone_screen",
+      "variant": "dense"
+    },
+    {
+      "correctness": "PASS",
+      "dtype": "bfloat16",
+      "epilogue": null,
+      "flop_count": 20266198323167232,
+      "flop_model": "QK+PV; causal uses one-half dense work; ReLU excluded",
+      "gpu": "NVIDIA B200",
+      "implementation": "helion-cute",
+      "median_ms": 26666.796875,
+      "median_tflops": 759.9787262851468,
+      "physical_gpu": 7,
+      "power_cap_recorded": "yes",
+      "power_cap_w": 750,
+      "runs_ms": [
+        26666.9609375,
+        26669.412109375,
+        26660.083984375,
+        26668.216796875,
+        26657.865234375,
+        26602.453125,
+        26666.751953125,
+        26666.841796875,
+        26640.2421875,
+        26668.5078125,
+        26670.099609375,
+        26625.416015625
+      ],
+      "shape_bhsd": [
+        8,
+        32,
+        786432,
+        64
+      ],
+      "shape_order": 6,
+      "source_artifact": "bf16_b8_causal786432_helion_fa4_native_12pair_gpu7_20260813.jsonl",
+      "timing_mode": "randomized_paired",
+      "variant": "causal"
+    },
+    {
+      "correctness": "PASS",
+      "dtype": "bfloat16",
+      "epilogue": null,
+      "flop_count": 20266198323167232,
+      "flop_model": "QK+PV; causal uses one-half dense work; ReLU excluded",
+      "gpu": "NVIDIA B200",
+      "implementation": "sdpa",
+      "median_ms": 27092.166015625,
+      "median_tflops": 748.0464393832153,
+      "physical_gpu": 7,
+      "power_cap_recorded": "yes",
+      "power_cap_w": 750,
+      "runs_ms": [
+        27069.724609375,
+        27095.96875,
+        27083.74609375,
+        27006.1875,
+        27043.82421875,
+        27103.162109375,
+        27090.921875,
+        27115.423828125,
+        27133.708984375,
+        27093.796875,
+        27087.966796875,
+        27093.41015625
+      ],
+      "shape_bhsd": [
+        8,
+        32,
+        786432,
+        64
+      ],
+      "shape_order": 6,
+      "source_artifact": "bf16_b8_causal786432_hybrid_full_paired_standard_gpu7_20260815.jsonl",
+      "timing_mode": "randomized_paired",
+      "variant": "causal"
+    },
+    {
+      "correctness": "PASS",
+      "dtype": "bfloat16",
+      "epilogue": null,
+      "flop_count": 20266198323167232,
+      "flop_model": "QK+PV; causal uses one-half dense work; ReLU excluded",
+      "gpu": "NVIDIA B200",
+      "implementation": "fa4",
+      "median_ms": 27029.8330078125,
+      "median_tflops": 749.7714957140003,
+      "physical_gpu": 7,
+      "power_cap_recorded": "yes",
+      "power_cap_w": 750,
+      "runs_ms": [
+        27024.2890625,
+        27031.90234375,
+        27028.984375,
+        27031.990234375,
+        27029.51953125,
+        27031.015625,
+        27030.51953125,
+        27030.4140625,
+        27029.87890625,
+        27027.8984375,
+        27029.787109375,
+        27029.33203125
+      ],
+      "shape_bhsd": [
+        8,
+        32,
+        786432,
+        64
+      ],
+      "shape_order": 6,
+      "source_artifact": "bf16_b8_causal786432_helion_fa4_native_12pair_gpu7_20260813.jsonl",
+      "timing_mode": "randomized_paired",
+      "variant": "causal"
+    },
+    {
+      "correctness": "PASS",
+      "dtype": "bfloat16",
+      "epilogue": null,
+      "flop_count": 20266198323167232,
+      "flop_model": "QK+PV; causal uses one-half dense work; ReLU excluded",
+      "gpu": "NVIDIA B200",
+      "implementation": "flexattention-cute",
+      "median_ms": 31251.544921875,
+      "median_tflops": 648.4862868005478,
+      "physical_gpu": 6,
+      "power_cap_recorded": "yes",
+      "power_cap_w": 750,
+      "runs_ms": [
+        31076.12890625,
+        31251.544921875,
+        31288.552734375
+      ],
+      "shape_bhsd": [
+        8,
+        32,
+        786432,
+        64
+      ],
+      "shape_order": 6,
+      "source_artifact": "bf16_b8_causal786432_flex_cute_perf_gpu6_20260815.json",
+      "timing_mode": "standalone_screen",
+      "variant": "causal"
+    },
+    {
+      "correctness": "PASS",
+      "dtype": "bfloat16",
+      "epilogue": "ReLU",
+      "flop_count": 4503599627370496,
+      "flop_model": "QK+PV; causal uses one-half dense work; ReLU excluded",
+      "gpu": "NVIDIA B200",
+      "implementation": "helion-cute",
+      "median_ms": 5689.415771484375,
+      "median_tflops": 791.575059418711,
+      "physical_gpu": 7,
+      "power_cap_recorded": "yes",
+      "power_cap_w": 750,
+      "runs_ms": [
+        5693.24169921875,
+        5677.431640625,
+        5680.1533203125,
+        5685.58984375,
+        5684.8818359375,
+        5699.79150390625,
+        5701.2490234375,
+        5698.51953125,
+        5696.8193359375,
+        5698.9072265625,
+        5679.78125,
+        5683.8564453125
+      ],
+      "shape_bhsd": [
+        2,
+        32,
+        524288,
+        64
+      ],
+      "shape_order": 7,
+      "source_artifact": "bf16-pointwise-relu-dense-full-audit-gpu7.jsonl",
+      "timing_mode": "randomized_paired",
+      "variant": "dense"
+    },
+    {
+      "correctness": "PASS",
+      "dtype": "bfloat16",
+      "epilogue": "ReLU",
+      "flop_count": 4503599627370496,
+      "flop_model": "QK+PV; causal uses one-half dense work; ReLU excluded",
+      "gpu": "NVIDIA B200",
+      "implementation": "sdpa",
+      "median_ms": 5738.8818359375,
+      "median_tflops": 784.7521095779438,
+      "physical_gpu": 7,
+      "power_cap_recorded": "yes",
+      "power_cap_w": 750,
+      "runs_ms": [
+        5730.712890625,
+        5729.3876953125,
+        5741.6396484375,
+        5721.51416015625,
+        5753.39697265625,
+        5718.38671875,
+        5746.49853515625,
+        5731.32666015625,
+        5736.68212890625,
+        5742.189453125,
+        5764.63330078125,
+        5741.08154296875
+      ],
+      "shape_bhsd": [
+        2,
+        32,
+        524288,
+        64
+      ],
+      "shape_order": 7,
+      "source_artifact": "bf16-pointwise-relu-dense-full-audit-gpu7.jsonl",
+      "timing_mode": "randomized_paired",
+      "variant": "dense"
+    },
+    {
+      "correctness": "PASS",
+      "dtype": "bfloat16",
+      "epilogue": "ReLU",
+      "flop_count": 4503599627370496,
+      "flop_model": "QK+PV; causal uses one-half dense work; ReLU excluded",
+      "gpu": "NVIDIA B200",
+      "implementation": "fa4",
+      "median_ms": 7122.6318359375,
+      "median_tflops": 632.2943163575322,
+      "physical_gpu": 7,
+      "power_cap_recorded": "yes",
+      "power_cap_w": 750,
+      "runs_ms": [
+        7119.51025390625,
+        7125.75341796875,
+        7126.01416015625,
+        7112.19482421875
+      ],
+      "shape_bhsd": [
+        2,
+        32,
+        524288,
+        64
+      ],
+      "shape_order": 7,
+      "source_artifact": "bf16-pointwise-relu-dense-fa4-screen-gpu7.jsonl",
+      "timing_mode": "standalone_screen",
+      "variant": "dense"
+    },
+    {
+      "correctness": "PASS",
+      "dtype": "bfloat16",
+      "epilogue": "ReLU",
+      "flop_count": 4503599627370496,
+      "flop_model": "QK+PV; causal uses one-half dense work; ReLU excluded",
+      "gpu": "NVIDIA B200",
+      "implementation": "flexattention-cute",
+      "median_ms": 6055.222900390625,
+      "median_tflops": 743.7545572566728,
+      "physical_gpu": 7,
+      "power_cap_recorded": "yes",
+      "power_cap_w": 750,
+      "runs_ms": [
+        6055.55712890625,
+        6054.888671875,
+        6051.810546875,
+        6066.232421875
+      ],
+      "shape_bhsd": [
+        2,
+        32,
+        524288,
+        64
+      ],
+      "shape_order": 7,
+      "source_artifact": "bf16-pointwise-relu-dense-flex-cute-screen-gpu7.jsonl",
+      "timing_mode": "standalone_screen",
+      "variant": "dense"
+    },
+    {
+      "correctness": "PASS",
+      "dtype": "bfloat16",
+      "epilogue": "ReLU",
+      "flop_count": 9007199254740992,
+      "flop_model": "QK+PV; causal uses one-half dense work; ReLU excluded",
+      "gpu": "NVIDIA B200",
+      "implementation": "helion-cute",
+      "median_ms": 11787.7451171875,
+      "median_tflops": 764.1155424719657,
+      "physical_gpu": 7,
+      "power_cap_recorded": "yes",
+      "power_cap_w": 750,
+      "runs_ms": [
+        11839.919921875,
+        11835.404296875,
+        11811.759765625,
+        11807.53125,
+        11796.5732421875,
+        11785.3203125,
+        11790.169921875,
+        11778.9501953125,
+        11780.86328125,
+        11778.390625,
+        11776.1279296875,
+        11773.3505859375
+      ],
+      "shape_bhsd": [
+        2,
+        32,
+        1048576,
+        64
+      ],
+      "shape_order": 8,
+      "source_artifact": "bf16-pointwise-relu-causal-fullwinner-fa4-12pair-gpu7.jsonl",
+      "timing_mode": "randomized_paired",
+      "variant": "causal"
+    },
+    {
+      "correctness": "PASS",
+      "dtype": "bfloat16",
+      "epilogue": "ReLU",
+      "flop_count": 9007199254740992,
+      "flop_model": "QK+PV; causal uses one-half dense work; ReLU excluded",
+      "gpu": "NVIDIA B200",
+      "implementation": "sdpa",
+      "median_ms": 12144.41162109375,
+      "median_tflops": 741.6744043075993,
+      "physical_gpu": 6,
+      "power_cap_recorded": "yes",
+      "power_cap_w": 750,
+      "runs_ms": [
+        12134.5234375,
+        12154.955078125,
+        12159.6904296875,
+        12130.3818359375,
+        12130.9560546875,
+        12133.1904296875,
+        12152.919921875,
+        12134.3994140625,
+        12135.9033203125,
+        12154.146484375,
+        12158.560546875,
+        12155.9951171875
+      ],
+      "shape_bhsd": [
+        2,
+        32,
+        1048576,
+        64
+      ],
+      "shape_order": 8,
+      "source_artifact": "bf16-pointwise-relu-causal-full-audit-gpu6.jsonl",
+      "timing_mode": "randomized_paired",
+      "variant": "causal"
+    },
+    {
+      "correctness": "PASS",
+      "dtype": "bfloat16",
+      "epilogue": "ReLU",
+      "flop_count": 9007199254740992,
+      "flop_model": "QK+PV; causal uses one-half dense work; ReLU excluded",
+      "gpu": "NVIDIA B200",
+      "implementation": "fa4",
+      "median_ms": 11984.2998046875,
+      "median_tflops": 751.5832715748604,
+      "physical_gpu": 7,
+      "power_cap_recorded": "yes",
+      "power_cap_w": 750,
+      "runs_ms": [
+        11991.5029296875,
+        11991.1904296875,
+        11983.357421875,
+        11988.55078125,
+        11985.013671875,
+        11985.455078125,
+        11985.619140625,
+        11983.5859375,
+        11982.2802734375,
+        11982.3408203125,
+        11980.623046875,
+        11979.517578125
+      ],
+      "shape_bhsd": [
+        2,
+        32,
+        1048576,
+        64
+      ],
+      "shape_order": 8,
+      "source_artifact": "bf16-pointwise-relu-causal-fullwinner-fa4-12pair-gpu7.jsonl",
+      "timing_mode": "randomized_paired",
+      "variant": "causal"
+    },
+    {
+      "correctness": "PASS",
+      "dtype": "bfloat16",
+      "epilogue": "ReLU",
+      "flop_count": 9007199254740992,
+      "flop_model": "QK+PV; causal uses one-half dense work; ReLU excluded",
+      "gpu": "NVIDIA B200",
+      "implementation": "flexattention-cute",
+      "median_ms": 13632.73046875,
+      "median_tflops": 660.7039782227039,
+      "physical_gpu": 6,
+      "power_cap_recorded": "yes",
+      "power_cap_w": 750,
+      "runs_ms": [
+        13619.0166015625,
+        13642.111328125,
+        13629.880859375,
+        13635.580078125
+      ],
+      "shape_bhsd": [
+        2,
+        32,
+        1048576,
+        64
+      ],
+      "shape_order": 8,
+      "source_artifact": "bf16-pointwise-relu-causal-flex-cute-screen-gpu6.jsonl",
+      "timing_mode": "standalone_screen",
+      "variant": "causal"
+    }
+  ],
+  "schema_version": 1,
+  "source_artifacts": {
+    "bf16-d128-causal524288-rank0-self-contained-audit-gpu7.jsonl": {
+      "sha256": "64559db6863274950367e7eae72bfa5285e5a4039936c050cf7dfafedd1bd96f",
+      "size_bytes": 9170
+    },
+    "bf16-d128-dense262144-rank0-self-contained-audit-gpu7.jsonl": {
+      "sha256": "f8b0ff35c77b0240904399ee24af5760712a7255083d43186efbc4b1529995d7",
+      "size_bytes": 9305
+    },
+    "bf16-pointwise-relu-causal-flex-cute-screen-gpu6.jsonl": {
+      "sha256": "7b500d4032a28e0dc287b23aeff0c543b955bb4eec63a1e5def8be2524ca44e7",
+      "size_bytes": 5253
+    },
+    "bf16-pointwise-relu-causal-full-audit-gpu6.jsonl": {
+      "sha256": "0c7785f17b3775c7cb1f91f072ef0c7acf62bdc299f3cca32a49a2ba7074c8d8",
+      "size_bytes": 676104
+    },
+    "bf16-pointwise-relu-causal-fullwinner-fa4-12pair-gpu7.jsonl": {
+      "sha256": "4e8a333cff5090dcfbfd0a2b62f3102a35f4b15aa7fe7f91a22e0707777ec8e2",
+      "size_bytes": 6082
+    },
+    "bf16-pointwise-relu-dense-fa4-screen-gpu7.jsonl": {
+      "sha256": "350c27cba451fd128c82ef15ffb91970d34f3eae8d8ef1d7ae86140f7fb7e134",
+      "size_bytes": 4559
+    },
+    "bf16-pointwise-relu-dense-flex-cute-screen-gpu7.jsonl": {
+      "sha256": "44b107fe001451b9575939b0a4db576193ff8438ab362449da943b005cd19797",
+      "size_bytes": 4916
+    },
+    "bf16-pointwise-relu-dense-full-audit-gpu7.jsonl": {
+      "sha256": "b425938123aca461cfd091094a1a8a39af11082e2b48e4fce3f31565fc94574c",
+      "size_bytes": 135404
+    },
+    "bf16_b1_causal1048576_baselines_gpu6_20260814.json": {
+      "sha256": "efa0295ea982701954d00e531c8e5668e048376f252c754765a54bfdeae1baf3",
+      "size_bytes": 1277
+    },
+    "bf16_b1_causal1048576_fa4flex_gpu6_20260814.json": {
+      "sha256": "976e3cae1963d549d5a87a7ee2c125e99c8c7ba6630ac2163811a6e938edf06d",
+      "size_bytes": 1677
+    },
+    "bf16_b1_causal1048576_promoted_vs_fullwinner_vs_fa4_12round_gpu7_20260814.jsonl": {
+      "sha256": "0517ba0bad8784829007ff23c1a5bcb7b75c1823423d2fe6528ba40844dc6ed7",
+      "size_bytes": 11195
+    },
+    "bf16_b1_dense524_baselines_gpu7_20260814.json": {
+      "sha256": "5a2b5c747beb01cc0d9428b8f4c9cb00dacd0ee0184e36d471449819437165bd",
+      "size_bytes": 2611
+    },
+    "bf16_b1_dense_winner_12pair_gpu7_20260814.jsonl": {
+      "sha256": "879591cb7e0f78288172d0df673b46f0b2f885da08cebcffdcdd0c1083438c3e",
+      "size_bytes": 8019
+    },
+    "bf16_b8_causal786432_flex_cute_perf_gpu6_20260815.json": {
+      "sha256": "684f452d73b726730f8e5796e68f8291f98c8e97018900ff8eb6065c1c88aaf9",
+      "size_bytes": 843
+    },
+    "bf16_b8_causal786432_helion_fa4_native_12pair_gpu7_20260813.jsonl": {
+      "sha256": "c4ebbffbc9bcf2e8b6d3a105851e9d75abe1bce970d40037f4b68edde14ecb5b",
+      "size_bytes": 5779
+    },
+    "bf16_b8_causal786432_hybrid_full_paired_standard_gpu7_20260815.jsonl": {
+      "sha256": "f77e3a6858e630bd8f3aadcce957834d6edd1aa0c30f8a9533519b824a588e4c",
+      "size_bytes": 14939
+    },
+    "bf16_b8_dense524288_fa4_gpu6_20260814.json": {
+      "sha256": "1e63b763c9953a886882cf55c79171decdcb187eaa83f3c216f822f867596814",
+      "size_bytes": 712
+    },
+    "bf16_b8_dense524288_flex_cute_direct_gpu6_20260814.json": {
+      "sha256": "98c609635d96b6745bdfe230e281dc95f8fce6af5678b78a67c4a7120139d255",
+      "size_bytes": 630
+    },
+    "bf16_b8_dense524288_rank0_vs_sdpa_12pair_gpu7_20260813.jsonl": {
+      "sha256": "011540ac11111bc5791cdeb0d2a1357c1d7095e1142e544ddfe001715ed867d0",
+      "size_bytes": 5965
+    },
+    "d128_causal524_fa4_flex_20260814.json": {
+      "sha256": "cefb11c96bd4f464d55f0b8b5c5ebf8e9960571af453f8bd6969f2603189432d",
+      "size_bytes": 1761
+    },
+    "d128_dense262_fa4_flex_20260814.json": {
+      "sha256": "c2099d8d72b746e23b4d549335b9d176550c2a21da19999452bd4e188e49ad04",
+      "size_bytes": 1915
+    }
+  }
+}

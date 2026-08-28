@@ -1,0 +1,883 @@
+from __future__ import annotations
+
+import torch
+import triton
+import triton.language as tl
+
+_LOG2E = 1.4426950408889634
+
+try:  # pragma: no cover
+    from triton.tools.tensor_descriptor import TensorDescriptor as _TensorDescriptor
+except Exception:  # pragma: no cover
+    _TensorDescriptor = None
+
+_ALLOC_DONE = [False]
+
+
+def _ensure_alloc():
+    if _ALLOC_DONE[0]:
+        return
+    _ALLOC_DONE[0] = True
+    try:
+        def _alloc_fn(size: int, alignment: int, stream):
+            return torch.empty(size, dtype=torch.int8, device="cuda")
+
+        triton.set_allocator(_alloc_fn)
+    except Exception:
+        pass
+
+
+# --------------------------------------------------------------------------- #
+#  Shared online-softmax step (used for the diagonal band / bound priming).
+# --------------------------------------------------------------------------- #
+@triton.jit
+def _fm_online_step(acc, l_i, m_i, q, desc_k, desc_v, offs_kv, start_n,
+                    qk_scale, offs_m, offs_n, MASKED: tl.constexpr,
+                    DTYPE: tl.constexpr):
+    k = desc_k.load([offs_kv, 0]).T
+    s = tl.dot(q, k) * qk_scale
+    if MASKED:
+        s = s + tl.where(offs_m[:, None] >= (start_n + offs_n[None, :]),
+                         0.0, -1.0e6)
+    m_new = tl.maximum(m_i, tl.max(s, 1))
+    alpha = tl.math.exp2(m_i - m_new)
+    p = tl.math.exp2(s - m_new[:, None])
+    l_i = l_i * alpha + tl.sum(p, 1)
+    v = desc_v.load([offs_kv, 0])
+    acc = acc * alpha[:, None]
+    acc = tl.dot(p.to(DTYPE), v, acc)
+    return acc, l_i, m_new
+
+
+# --------------------------------------------------------------------------- #
+#  "fmp" : frozen-bound softmax + manual cross-iteration MMA pipelining.
+#
+#  The frozen bound removes every cross-iteration dependency (no row max, no
+#  alpha, no acc rescale), which makes it legal to issue the QK GEMM of tile
+#  i+1 *before* the exp2 of tile i.  The tensor pipe therefore runs underneath
+#  the SFU phase instead of waiting for it, and the PV GEMM (async tcgen05,
+#  accumulating in TMEM) hides under the next tile's exp2.
+# --------------------------------------------------------------------------- #
+@triton.jit
+def _fmp_step(acc, l_i, qk, m_b, q, desc_k, desc_v, offset_y, start_n,
+              qk_scale, BLOCK_N: tl.constexpr, DTYPE: tl.constexpr):
+    # ---- issue next tile's QK GEMM first: independent of everything below
+    kn = desc_k.load([offset_y + start_n + BLOCK_N, 0]).T
+    qk_next = tl.dot(q, kn)
+
+    # ---- softmax of the current tile (SFU) overlaps the GEMM above
+    p = tl.math.exp2(qk * qk_scale - m_b[:, None])
+    l_i = l_i + tl.sum(p, 1)
+
+    v = desc_v.load([offset_y + start_n, 0])
+    acc = tl.dot(p.to(DTYPE), v, acc)
+    return acc, l_i, qk_next
+
+
+@triton.jit
+def _fmp_loop(acc, l_i, qk, m_b, q, desc_k, desc_v, offset_y, lo, hi, qk_scale,
+              BLOCK_N: tl.constexpr, DTYPE: tl.constexpr, WS: tl.constexpr):
+    if WS:
+        for start_n in tl.range(lo, hi, BLOCK_N, warp_specialize=True):
+            start_n = tl.multiple_of(start_n, BLOCK_N)
+            acc, l_i, qk = _fmp_step(acc, l_i, qk, m_b, q, desc_k, desc_v,
+                                     offset_y, start_n, qk_scale, BLOCK_N,
+                                     DTYPE)
+    else:
+        for start_n in tl.range(lo, hi, BLOCK_N):
+            start_n = tl.multiple_of(start_n, BLOCK_N)
+            acc, l_i, qk = _fmp_step(acc, l_i, qk, m_b, q, desc_k, desc_v,
+                                     offset_y, start_n, qk_scale, BLOCK_N,
+                                     DTYPE)
+    return acc, l_i
+
+
+@triton.jit
+def _attn_fwd_fmp(desc_q, desc_k, desc_v, desc_o, qk_scale, N_CTX,
+                  BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr,
+                  HEAD_DIM: tl.constexpr, DTYPE: tl.constexpr,
+                  WS: tl.constexpr, MARGIN: tl.constexpr, CORR: tl.constexpr):
+    pid = tl.program_id(0)
+    num_m = N_CTX // BLOCK_M
+    # longest-processing-time-first; m-major grid keeps all resident CTAs
+    # inside the same (b, h) so K/V streams stay resident in L2.
+    start_m = num_m - 1 - pid
+
+    off_bh = tl.program_id(1)
+    offset_y = off_bh * N_CTX
+    qo_y = offset_y + start_m * BLOCK_M
+
+    offs_m = start_m * BLOCK_M + tl.arange(0, BLOCK_M)
+    offs_n = tl.arange(0, BLOCK_N)
+
+    q = desc_q.load([qo_y, 0])
+
+    m_i = tl.zeros([BLOCK_M], dtype=tl.float32) - float("inf")
+    l_i = tl.zeros([BLOCK_M], dtype=tl.float32)
+    acc = tl.zeros([BLOCK_M, HEAD_DIM], dtype=tl.float32)
+
+    hi = start_m * BLOCK_M
+
+    # ---- diagonal (masked) band, classic online softmax
+    for start_n in tl.range(hi, hi + BLOCK_M, BLOCK_N):
+        start_n = tl.multiple_of(start_n, BLOCK_N)
+        acc, l_i, m_i = _fm_online_step(acc, l_i, m_i, q, desc_k, desc_v,
+                                        offset_y + start_n, start_n, qk_scale,
+                                        offs_m, offs_n, True, DTYPE)
+
+    if hi > 0:
+        # ---- first unmasked tile online: tightens the frozen bound
+        acc, l_i, m_i = _fm_online_step(acc, l_i, m_i, q, desc_k, desc_v,
+                                        offset_y, 0, qk_scale, offs_m, offs_n,
+                                        False, DTYPE)
+
+        # ---- freeze the bound (exact power-of-two rescale of acc / l)
+        m_b = m_i + MARGIN
+        acc = acc * CORR
+        l_i = l_i * CORR
+
+        # ---- prologue of the software pipeline
+        k0 = desc_k.load([offset_y + BLOCK_N, 0]).T
+        qk = tl.dot(q, k0)
+
+        acc, l_i = _fmp_loop(acc, l_i, qk, m_b, q, desc_k, desc_v, offset_y,
+                             BLOCK_N, hi, qk_scale, BLOCK_N, DTYPE, WS)
+
+    l_safe = tl.where(l_i == 0.0, 1.0, l_i)
+    acc = acc / l_safe[:, None]
+    desc_o.store([qo_y, 0], acc.to(DTYPE))
+
+
+# --------------------------------------------------------------------------- #
+#  "fm" path : frozen bound, no manual MMA pipelining (previous best).
+# --------------------------------------------------------------------------- #
+@triton.jit
+def _fm_step(acc, l_i, m_b, q, desc_k, desc_v, offs_kv, qk_scale,
+             DTYPE: tl.constexpr):
+    k = desc_k.load([offs_kv, 0]).T
+    qk = tl.dot(q, k)
+    p = tl.math.exp2(qk * qk_scale - m_b[:, None])
+    l_i = l_i + tl.sum(p, 1)
+    v = desc_v.load([offs_kv, 0])
+    acc = tl.dot(p.to(DTYPE), v, acc)
+    return acc, l_i
+
+
+@triton.jit
+def _fm_loop(acc, l_i, m_b, q, desc_k, desc_v, offset_y, lo, hi, qk_scale,
+             BLOCK_N: tl.constexpr, DTYPE: tl.constexpr, WS: tl.constexpr):
+    if WS:
+        for start_n in tl.range(lo, hi, BLOCK_N, warp_specialize=True):
+            start_n = tl.multiple_of(start_n, BLOCK_N)
+            acc, l_i = _fm_step(acc, l_i, m_b, q, desc_k, desc_v,
+                                offset_y + start_n, qk_scale, DTYPE)
+    else:
+        for start_n in tl.range(lo, hi, BLOCK_N):
+            start_n = tl.multiple_of(start_n, BLOCK_N)
+            acc, l_i = _fm_step(acc, l_i, m_b, q, desc_k, desc_v,
+                                offset_y + start_n, qk_scale, DTYPE)
+    return acc, l_i
+
+
+@triton.jit
+def _attn_fwd_fm(desc_q, desc_k, desc_v, desc_o, qk_scale, N_CTX,
+                 BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr,
+                 HEAD_DIM: tl.constexpr, DTYPE: tl.constexpr,
+                 WS: tl.constexpr, MARGIN: tl.constexpr, CORR: tl.constexpr):
+    pid = tl.program_id(0)
+    num_m = N_CTX // BLOCK_M
+    start_m = num_m - 1 - pid
+
+    off_bh = tl.program_id(1)
+    offset_y = off_bh * N_CTX
+    qo_y = offset_y + start_m * BLOCK_M
+
+    offs_m = start_m * BLOCK_M + tl.arange(0, BLOCK_M)
+    offs_n = tl.arange(0, BLOCK_N)
+
+    q = desc_q.load([qo_y, 0])
+
+    m_i = tl.zeros([BLOCK_M], dtype=tl.float32) - float("inf")
+    l_i = tl.zeros([BLOCK_M], dtype=tl.float32)
+    acc = tl.zeros([BLOCK_M, HEAD_DIM], dtype=tl.float32)
+
+    hi = start_m * BLOCK_M
+
+    for start_n in tl.range(hi, hi + BLOCK_M, BLOCK_N):
+        start_n = tl.multiple_of(start_n, BLOCK_N)
+        acc, l_i, m_i = _fm_online_step(acc, l_i, m_i, q, desc_k, desc_v,
+                                        offset_y + start_n, start_n, qk_scale,
+                                        offs_m, offs_n, True, DTYPE)
+
+    if hi > 0:
+        acc, l_i, m_i = _fm_online_step(acc, l_i, m_i, q, desc_k, desc_v,
+                                        offset_y, 0, qk_scale, offs_m, offs_n,
+                                        False, DTYPE)
+
+    m_b = m_i + MARGIN
+    acc = acc * CORR
+    l_i = l_i * CORR
+
+    acc, l_i = _fm_loop(acc, l_i, m_b, q, desc_k, desc_v, offset_y,
+                        BLOCK_N, hi, qk_scale, BLOCK_N, DTYPE, WS)
+
+    l_safe = tl.where(l_i == 0.0, 1.0, l_i)
+    acc = acc / l_safe[:, None]
+    desc_o.store([qo_y, 0], acc.to(DTYPE))
+
+
+# --------------------------------------------------------------------------- #
+#  Software-pipelined online path (candidate / fallback).
+# --------------------------------------------------------------------------- #
+@triton.jit
+def _pipe_step(acc, l_i, m_i, qk, q, desc_k, desc_v, offset_y, start_n,
+               qk_scale, offs_m, offs_n, BLOCK_N: tl.constexpr,
+               MASKED: tl.constexpr, DTYPE: tl.constexpr):
+    kn = desc_k.load([offset_y + start_n + BLOCK_N, 0]).T
+    qk_next = tl.dot(q, kn)
+
+    if MASKED:
+        s = qk * qk_scale + tl.where(
+            offs_m[:, None] >= (start_n + offs_n[None, :]), 0.0, -1.0e6)
+        m_ij = tl.maximum(m_i, tl.max(s, 1))
+        p = tl.math.exp2(s - m_ij[:, None])
+    else:
+        m_ij = tl.maximum(m_i, tl.max(qk, 1) * qk_scale)
+        p = tl.math.exp2(qk * qk_scale - m_ij[:, None])
+
+    alpha = tl.math.exp2(m_i - m_ij)
+    l_i = l_i * alpha + tl.sum(p, 1)
+
+    v = desc_v.load([offset_y + start_n, 0])
+    acc = acc * alpha[:, None]
+    acc = tl.dot(p.to(DTYPE), v, acc)
+    return acc, l_i, m_ij, qk_next
+
+
+@triton.jit
+def _attn_fwd_pipe(desc_q, desc_k, desc_v, desc_o, qk_scale, N_CTX,
+                   BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr,
+                   HEAD_DIM: tl.constexpr, DTYPE: tl.constexpr,
+                   WS: tl.constexpr):
+    pid = tl.program_id(0)
+    num_m = N_CTX // BLOCK_M
+    start_m = num_m - 1 - pid
+
+    off_bh = tl.program_id(1)
+    offset_y = off_bh * N_CTX
+    qo_y = offset_y + start_m * BLOCK_M
+
+    offs_m = start_m * BLOCK_M + tl.arange(0, BLOCK_M)
+    offs_n = tl.arange(0, BLOCK_N)
+
+    q = desc_q.load([qo_y, 0])
+
+    m_i = tl.zeros([BLOCK_M], dtype=tl.float32) - float("inf")
+    l_i = tl.zeros([BLOCK_M], dtype=tl.float32)
+    acc = tl.zeros([BLOCK_M, HEAD_DIM], dtype=tl.float32)
+
+    hi = start_m * BLOCK_M
+
+    k0 = desc_k.load([offset_y, 0]).T
+    qk = tl.dot(q, k0)
+
+    if WS:
+        for start_n in tl.range(0, hi, BLOCK_N, warp_specialize=True):
+            start_n = tl.multiple_of(start_n, BLOCK_N)
+            acc, l_i, m_i, qk = _pipe_step(acc, l_i, m_i, qk, q, desc_k,
+                                           desc_v, offset_y, start_n, qk_scale,
+                                           offs_m, offs_n, BLOCK_N, False,
+                                           DTYPE)
+    else:
+        for start_n in tl.range(0, hi, BLOCK_N):
+            start_n = tl.multiple_of(start_n, BLOCK_N)
+            acc, l_i, m_i, qk = _pipe_step(acc, l_i, m_i, qk, q, desc_k,
+                                           desc_v, offset_y, start_n, qk_scale,
+                                           offs_m, offs_n, BLOCK_N, False,
+                                           DTYPE)
+
+    for start_n in tl.range(hi, hi + BLOCK_M, BLOCK_N):
+        start_n = tl.multiple_of(start_n, BLOCK_N)
+        acc, l_i, m_i, qk = _pipe_step(acc, l_i, m_i, qk, q, desc_k, desc_v,
+                                       offset_y, start_n, qk_scale, offs_m,
+                                       offs_n, BLOCK_N, True, DTYPE)
+
+    l_safe = tl.where(l_i == 0.0, 1.0, l_i)
+    acc = acc / l_safe[:, None]
+    desc_o.store([qo_y, 0], acc.to(DTYPE))
+
+
+# --------------------------------------------------------------------------- #
+#  Plain TMA / MMAv5 path.
+# --------------------------------------------------------------------------- #
+@triton.jit
+def _tma_step(acc, l_i, m_i, q, desc_k, desc_v, offs_kv, start_n, qk_scale,
+              offs_m, offs_n, STAGE: tl.constexpr, DTYPE: tl.constexpr):
+    k = desc_k.load([offs_kv, 0]).T
+    qk = tl.dot(q, k)
+    if STAGE == 2:
+        mask = offs_m[:, None] >= (start_n + offs_n[None, :])
+        qk = qk * qk_scale + tl.where(mask, 0.0, -1.0e6)
+        m_ij = tl.maximum(m_i, tl.max(qk, 1))
+        qk = qk - m_ij[:, None]
+    else:
+        m_ij = tl.maximum(m_i, tl.max(qk, 1) * qk_scale)
+        qk = qk * qk_scale - m_ij[:, None]
+    p = tl.math.exp2(qk)
+    alpha = tl.math.exp2(m_i - m_ij)
+    l_ij = tl.sum(p, 1)
+    acc = acc * alpha[:, None]
+    v = desc_v.load([offs_kv, 0])
+    acc = tl.dot(p.to(DTYPE), v, acc)
+    l_i = l_i * alpha + l_ij
+    return acc, l_i, m_ij
+
+
+@triton.jit
+def _tma_loop(acc, l_i, m_i, q, desc_k, desc_v, offset_y, lo, hi, qk_scale,
+              offs_m, offs_n, BLOCK_N: tl.constexpr, STAGE: tl.constexpr,
+              DTYPE: tl.constexpr, WS: tl.constexpr):
+    offs_kv = offset_y + lo
+    if WS:
+        for start_n in tl.range(lo, hi, BLOCK_N, warp_specialize=True):
+            start_n = tl.multiple_of(start_n, BLOCK_N)
+            acc, l_i, m_i = _tma_step(acc, l_i, m_i, q, desc_k, desc_v, offs_kv,
+                                      start_n, qk_scale, offs_m, offs_n,
+                                      STAGE, DTYPE)
+            offs_kv += BLOCK_N
+    else:
+        for start_n in tl.range(lo, hi, BLOCK_N):
+            start_n = tl.multiple_of(start_n, BLOCK_N)
+            acc, l_i, m_i = _tma_step(acc, l_i, m_i, q, desc_k, desc_v, offs_kv,
+                                      start_n, qk_scale, offs_m, offs_n,
+                                      STAGE, DTYPE)
+            offs_kv += BLOCK_N
+    return acc, l_i, m_i
+
+
+@triton.jit
+def _attn_fwd_tma(desc_q, desc_k, desc_v, desc_o, qk_scale, N_CTX,
+                  BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr,
+                  HEAD_DIM: tl.constexpr, CAUSAL: tl.constexpr,
+                  DTYPE: tl.constexpr, WS: tl.constexpr):
+    pid = tl.program_id(0)
+    num_m = N_CTX // BLOCK_M
+    start_m = num_m - 1 - pid
+
+    off_bh = tl.program_id(1)
+    offset_y = off_bh * N_CTX
+    qo_y = offset_y + start_m * BLOCK_M
+
+    offs_m = start_m * BLOCK_M + tl.arange(0, BLOCK_M)
+    offs_n = tl.arange(0, BLOCK_N)
+
+    q = desc_q.load([qo_y, 0])
+
+    m_i = tl.zeros([BLOCK_M], dtype=tl.float32) - float("inf")
+    l_i = tl.zeros([BLOCK_M], dtype=tl.float32)
+    acc = tl.zeros([BLOCK_M, HEAD_DIM], dtype=tl.float32)
+
+    if CAUSAL:
+        hi1 = start_m * BLOCK_M
+        acc, l_i, m_i = _tma_loop(acc, l_i, m_i, q, desc_k, desc_v, offset_y,
+                                  0, hi1, qk_scale, offs_m, offs_n,
+                                  BLOCK_N, 1, DTYPE, WS)
+        lo2 = tl.multiple_of(start_m * BLOCK_M, BLOCK_M)
+        acc, l_i, m_i = _tma_loop(acc, l_i, m_i, q, desc_k, desc_v, offset_y,
+                                  lo2, lo2 + BLOCK_M, qk_scale, offs_m, offs_n,
+                                  BLOCK_N, 2, DTYPE, False)
+    else:
+        acc, l_i, m_i = _tma_loop(acc, l_i, m_i, q, desc_k, desc_v, offset_y,
+                                  0, N_CTX, qk_scale, offs_m, offs_n,
+                                  BLOCK_N, 1, DTYPE, WS)
+
+    l_safe = tl.where(l_i == 0.0, 1.0, l_i)
+    acc = acc / l_safe[:, None]
+    desc_o.store([qo_y, 0], acc.to(DTYPE))
+
+
+# --------------------------------------------------------------------------- #
+#  Pointer-based fallback path (works everywhere; used as the reference).
+# --------------------------------------------------------------------------- #
+@triton.jit
+def _attn_tile(acc, l_i, m_i, q, kt_ptrs, v_ptrs, qk_scale,
+               offs_m, offs_n, start_n, N_CTX,
+               MASK: tl.constexpr, EVEN_N: tl.constexpr, DTYPE: tl.constexpr):
+    if MASK == 0:
+        kt = tl.load(kt_ptrs)
+    else:
+        if MASK == 1 and EVEN_N:
+            kt = tl.load(kt_ptrs)
+        else:
+            kt = tl.load(kt_ptrs,
+                         mask=(start_n + offs_n)[None, :] < N_CTX, other=0.0)
+
+    qk = tl.dot(q, kt)
+
+    if MASK == 1:
+        n_idx = start_n + offs_n
+        qk = qk * qk_scale + tl.where(offs_m[:, None] >= n_idx[None, :],
+                                      0.0, -1.0e6)
+        m_new = tl.maximum(m_i, tl.max(qk, 1))
+        p = tl.math.exp2(qk - m_new[:, None])
+    elif MASK == 2:
+        n_idx = start_n + offs_n
+        qk = qk * qk_scale + tl.where(n_idx[None, :] < N_CTX, 0.0, -1.0e6)
+        m_new = tl.maximum(m_i, tl.max(qk, 1))
+        p = tl.math.exp2(qk - m_new[:, None])
+    else:
+        m_new = tl.maximum(m_i, tl.max(qk, 1) * qk_scale)
+        p = tl.math.exp2(qk * qk_scale - m_new[:, None])
+
+    alpha = tl.math.exp2(m_i - m_new)
+    l_i = l_i * alpha + tl.sum(p, 1)
+
+    if MASK == 0:
+        vt = tl.load(v_ptrs)
+    else:
+        if MASK == 1 and EVEN_N:
+            vt = tl.load(v_ptrs)
+        else:
+            vt = tl.load(v_ptrs,
+                         mask=(start_n + offs_n)[:, None] < N_CTX, other=0.0)
+
+    acc = acc * alpha[:, None]
+    acc = tl.dot(p.to(DTYPE), vt, acc)
+    return acc, l_i, m_new
+
+
+@triton.jit
+def _attn_loop(acc, l_i, m_i, q, k_base, v_base, stride_kn, stride_vn,
+               qk_scale, lo, hi, offs_m, offs_n, offs_d, N_CTX,
+               BLOCK_N: tl.constexpr, MASK: tl.constexpr,
+               EVEN_N: tl.constexpr, DTYPE: tl.constexpr, WS: tl.constexpr):
+    n0 = lo + offs_n
+    kt_ptrs = k_base + offs_d[:, None] + n0[None, :] * stride_kn
+    v_ptrs = v_base + n0[:, None] * stride_vn + offs_d[None, :]
+
+    if WS:
+        for start_n in tl.range(lo, hi, BLOCK_N, warp_specialize=True):
+            acc, l_i, m_i = _attn_tile(acc, l_i, m_i, q, kt_ptrs, v_ptrs,
+                                       qk_scale, offs_m, offs_n, start_n,
+                                       N_CTX, MASK, EVEN_N, DTYPE)
+            kt_ptrs = kt_ptrs + BLOCK_N * stride_kn
+            v_ptrs = v_ptrs + BLOCK_N * stride_vn
+    else:
+        for start_n in tl.range(lo, hi, BLOCK_N):
+            acc, l_i, m_i = _attn_tile(acc, l_i, m_i, q, kt_ptrs, v_ptrs,
+                                       qk_scale, offs_m, offs_n, start_n,
+                                       N_CTX, MASK, EVEN_N, DTYPE)
+            kt_ptrs = kt_ptrs + BLOCK_N * stride_kn
+            v_ptrs = v_ptrs + BLOCK_N * stride_vn
+
+    return acc, l_i, m_i
+
+
+@triton.jit
+def _attn_fwd(Q, K, V, O, qk_scale,
+              stride_qb, stride_qh, stride_qm,
+              stride_kb, stride_kh, stride_kn,
+              stride_vb, stride_vh, stride_vn,
+              stride_ob, stride_oh, stride_om,
+              H, N_CTX,
+              BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr,
+              HEAD_DIM: tl.constexpr, CAUSAL: tl.constexpr,
+              EVEN_N: tl.constexpr, DTYPE: tl.constexpr, WS: tl.constexpr):
+    pid = tl.program_id(0)
+    num_m_blocks = tl.cdiv(N_CTX, BLOCK_M)
+    start_m = num_m_blocks - 1 - pid
+
+    off_bh = tl.program_id(1).to(tl.int64)
+    off_b = off_bh // H
+    off_h = off_bh % H
+
+    q_base = Q + off_b * stride_qb + off_h * stride_qh
+    k_base = K + off_b * stride_kb + off_h * stride_kh
+    v_base = V + off_b * stride_vb + off_h * stride_vh
+    o_base = O + off_b * stride_ob + off_h * stride_oh
+
+    offs_m = start_m * BLOCK_M + tl.arange(0, BLOCK_M)
+    offs_n = tl.arange(0, BLOCK_N)
+    offs_d = tl.arange(0, HEAD_DIM)
+
+    q_ptrs = q_base + offs_m[:, None] * stride_qm + offs_d[None, :]
+    if EVEN_N:
+        q = tl.load(q_ptrs)
+    else:
+        q = tl.load(q_ptrs, mask=offs_m[:, None] < N_CTX, other=0.0)
+
+    m_i = tl.zeros([BLOCK_M], dtype=tl.float32) - float("inf")
+    l_i = tl.zeros([BLOCK_M], dtype=tl.float32)
+    acc = tl.zeros([BLOCK_M, HEAD_DIM], dtype=tl.float32)
+
+    if CAUSAL:
+        hi1 = start_m * BLOCK_M
+        acc, l_i, m_i = _attn_loop(acc, l_i, m_i, q, k_base, v_base,
+                                   stride_kn, stride_vn, qk_scale,
+                                   0, hi1, offs_m, offs_n, offs_d, N_CTX,
+                                   BLOCK_N, 0, EVEN_N, DTYPE, WS)
+        lo2 = tl.multiple_of(start_m * BLOCK_M, BLOCK_M)
+        hi2 = tl.minimum((start_m + 1) * BLOCK_M, N_CTX)
+        acc, l_i, m_i = _attn_loop(acc, l_i, m_i, q, k_base, v_base,
+                                   stride_kn, stride_vn, qk_scale,
+                                   lo2, hi2, offs_m, offs_n, offs_d, N_CTX,
+                                   BLOCK_N, 1, EVEN_N, DTYPE, False)
+    else:
+        if EVEN_N:
+            acc, l_i, m_i = _attn_loop(acc, l_i, m_i, q, k_base, v_base,
+                                       stride_kn, stride_vn, qk_scale,
+                                       0, N_CTX, offs_m, offs_n, offs_d, N_CTX,
+                                       BLOCK_N, 0, EVEN_N, DTYPE, WS)
+        else:
+            hi1 = (N_CTX // BLOCK_N) * BLOCK_N
+            acc, l_i, m_i = _attn_loop(acc, l_i, m_i, q, k_base, v_base,
+                                       stride_kn, stride_vn, qk_scale,
+                                       0, hi1, offs_m, offs_n, offs_d, N_CTX,
+                                       BLOCK_N, 0, EVEN_N, DTYPE, WS)
+            acc, l_i, m_i = _attn_loop(acc, l_i, m_i, q, k_base, v_base,
+                                       stride_kn, stride_vn, qk_scale,
+                                       hi1, N_CTX, offs_m, offs_n, offs_d,
+                                       N_CTX, BLOCK_N, 2, EVEN_N, DTYPE, False)
+
+    l_safe = tl.where(l_i == 0.0, 1.0, l_i)
+    acc = acc / l_safe[:, None]
+
+    o_ptrs = o_base + offs_m[:, None] * stride_om + offs_d[None, :]
+    if EVEN_N:
+        tl.store(o_ptrs, acc.to(DTYPE))
+    else:
+        tl.store(o_ptrs, acc.to(DTYPE), mask=offs_m[:, None] < N_CTX)
+
+
+# --------------------------------------------------------------------------- #
+#  Launch helpers (allocation / configuration / launch only).
+# --------------------------------------------------------------------------- #
+_BEST_CFG: dict = {}
+_MAXNREG_OK = [True]
+
+# (kind, BLOCK_M, BLOCK_N, num_warps, num_stages, warp_specialize, maxnreg)
+_FALLBACK = ("ptr", 128, 64, 8, 3, False, None)
+
+_FM_MARGIN = 2.0
+_FM_CORR = 0.25   # 2 ** -_FM_MARGIN  (exact)
+
+
+def _tl_dtype(t):
+    return tl.float16 if t.dtype == torch.float16 else tl.bfloat16
+
+
+def _make_desc(t2d, block_shape):
+    try:
+        return _TensorDescriptor.from_tensor(t2d, block_shape)
+    except Exception:
+        return _TensorDescriptor(t2d, list(t2d.shape), list(t2d.stride()),
+                                 list(block_shape))
+
+
+def _descs(q, k, v, out, bm, bn):
+    B, H, N, D = q.shape
+    y = B * H * N
+    dq = _make_desc(q.view(y, D), [bm, D])
+    dk = _make_desc(k.view(y, D), [bn, D])
+    dv = _make_desc(v.view(y, D), [bn, D])
+    do = _make_desc(out.view(y, D), [bm, D])
+    return dq, dk, dv, do
+
+
+def _launch_frozen(kern, q, k, v, out, qk_scale, cfg):
+    B, H, N, D = q.shape
+    _, bm, bn, warps, stages, ws, maxnreg = cfg
+    dq, dk, dv, do = _descs(q, k, v, out, bm, bn)
+    grid = (N // bm, B * H)
+    kws = dict(BLOCK_M=bm, BLOCK_N=bn, HEAD_DIM=D, DTYPE=_tl_dtype(q),
+               WS=ws, MARGIN=_FM_MARGIN, CORR=_FM_CORR,
+               num_warps=warps, num_stages=stages)
+
+    if maxnreg is not None and _MAXNREG_OK[0]:
+        try:
+            kern[grid](dq, dk, dv, do, qk_scale, N, maxnreg=maxnreg, **kws)
+            return
+        except TypeError:
+            _MAXNREG_OK[0] = False
+
+    kern[grid](dq, dk, dv, do, qk_scale, N, **kws)
+
+
+def _launch_pipe(q, k, v, out, qk_scale, causal, cfg):
+    B, H, N, D = q.shape
+    _, bm, bn, warps, stages, ws, maxnreg = cfg
+    dq, dk, dv, do = _descs(q, k, v, out, bm, bn)
+    grid = (N // bm, B * H)
+    kws = dict(BLOCK_M=bm, BLOCK_N=bn, HEAD_DIM=D, DTYPE=_tl_dtype(q),
+               WS=ws, num_warps=warps, num_stages=stages)
+
+    if maxnreg is not None and _MAXNREG_OK[0]:
+        try:
+            _attn_fwd_pipe[grid](dq, dk, dv, do, qk_scale, N,
+                                 maxnreg=maxnreg, **kws)
+            return
+        except TypeError:
+            _MAXNREG_OK[0] = False
+
+    _attn_fwd_pipe[grid](dq, dk, dv, do, qk_scale, N, **kws)
+
+
+def _launch_tma(q, k, v, out, qk_scale, causal, cfg):
+    B, H, N, D = q.shape
+    _, bm, bn, warps, stages, ws, maxnreg = cfg
+    dq, dk, dv, do = _descs(q, k, v, out, bm, bn)
+
+    grid = (N // bm, B * H)
+    kws = dict(BLOCK_M=bm, BLOCK_N=bn, HEAD_DIM=D, CAUSAL=causal,
+               DTYPE=_tl_dtype(q), WS=ws, num_warps=warps, num_stages=stages)
+
+    if maxnreg is not None and _MAXNREG_OK[0]:
+        try:
+            _attn_fwd_tma[grid](dq, dk, dv, do, qk_scale, N,
+                                maxnreg=maxnreg, **kws)
+            return
+        except TypeError:
+            _MAXNREG_OK[0] = False
+
+    _attn_fwd_tma[grid](dq, dk, dv, do, qk_scale, N, **kws)
+
+
+def _launch_ptr(q, k, v, out, qk_scale, causal, cfg):
+    B, H, N, D = q.shape
+    _, bm, bn, warps, stages, ws, maxnreg = cfg
+    even_n = (N % bm == 0) and (N % bn == 0)
+    grid = (triton.cdiv(N, bm), B * H)
+
+    args = (q, k, v, out, qk_scale,
+            q.stride(0), q.stride(1), q.stride(2),
+            k.stride(0), k.stride(1), k.stride(2),
+            v.stride(0), v.stride(1), v.stride(2),
+            out.stride(0), out.stride(1), out.stride(2),
+            H, N)
+    kws = dict(BLOCK_M=bm, BLOCK_N=bn, HEAD_DIM=D, CAUSAL=causal,
+               EVEN_N=even_n, DTYPE=_tl_dtype(q), WS=ws,
+               num_warps=warps, num_stages=stages)
+
+    if maxnreg is not None and _MAXNREG_OK[0]:
+        try:
+            _attn_fwd[grid](*args, maxnreg=maxnreg, **kws)
+            return
+        except TypeError:
+            _MAXNREG_OK[0] = False
+
+    _attn_fwd[grid](*args, **kws)
+
+
+def _launch(q, k, v, out, qk_scale, causal, cfg):
+    kind = cfg[0]
+    if kind == "fmp":
+        _ensure_alloc()
+        _launch_frozen(_attn_fwd_fmp, q, k, v, out, qk_scale, cfg)
+    elif kind == "fm":
+        _ensure_alloc()
+        _launch_frozen(_attn_fwd_fm, q, k, v, out, qk_scale, cfg)
+    elif kind == "pipe":
+        _ensure_alloc()
+        _launch_pipe(q, k, v, out, qk_scale, causal, cfg)
+    elif kind == "tma":
+        _ensure_alloc()
+        _launch_tma(q, k, v, out, qk_scale, causal, cfg)
+    else:
+        _launch_ptr(q, k, v, out, qk_scale, causal, cfg)
+
+
+def _candidate_configs(N: int, D: int, tma_ok: bool, causal: bool):
+    if N < 256:
+        b = max(16, min(128, triton.next_power_of_2(N)))
+        return [("ptr", b, b, 4, 2, False, None)]
+
+    if D <= 64:
+        cands = [
+            # frozen bound + manual cross-iteration MMA pipelining:
+            # the QK GEMM of tile i+1 is issued before the exp2 of tile i so
+            # the tensor pipe runs underneath the SFU-bound softmax phase.
+            ("fmp", 128, 128, 8, 3, True, None),
+            ("fmp", 128, 128, 8, 2, True, None),
+            ("fmp", 128, 128, 8, 4, True, None),
+            ("fmp", 128, 128, 8, 3, False, None),
+            ("fmp", 128, 64, 8, 3, True, None),
+            ("fmp", 128, 64, 8, 4, True, None),
+            ("fmp", 128, 64, 4, 4, True, None),
+            # previous best paths, kept as candidates / safety net
+            ("fm", 128, 128, 8, 3, True, None),
+            ("fm", 128, 128, 8, 2, True, None),
+            ("fm", 128, 64, 8, 3, True, None),
+            ("pipe", 128, 128, 8, 3, True, None),
+            ("tma", 128, 128, 8, 4, True, None),
+            ("ptr", 128, 64, 8, 3, False, None),
+        ]
+    elif D <= 128:
+        cands = [
+            ("fmp", 128, 128, 8, 3, True, None),
+            ("fmp", 128, 64, 8, 3, True, None),
+            ("fmp", 128, 128, 8, 2, True, None),
+            ("fm", 128, 128, 8, 3, True, None),
+            ("fm", 128, 64, 8, 3, True, None),
+            ("pipe", 128, 128, 8, 3, True, None),
+            ("tma", 128, 128, 8, 3, True, 168),
+            ("tma", 128, 128, 8, 4, True, None),
+            ("ptr", 128, 64, 8, 3, False, None),
+        ]
+    else:
+        cands = [
+            ("ptr", 64, 64, 4, 3, False, None),
+            ("ptr", 64, 32, 4, 3, False, None),
+            ("ptr", 128, 32, 8, 2, False, None),
+        ]
+
+    keep = []
+    for c in cands:
+        kind, bm, bn = c[0], c[1], c[2]
+        if kind in ("tma", "pipe", "fm", "fmp"):
+            if not tma_ok or _TensorDescriptor is None:
+                continue
+            if N % bm != 0 or N % bn != 0:
+                continue
+        if kind in ("pipe", "fm", "fmp"):
+            if not causal:
+                continue
+            if bm % bn != 0:
+                continue
+        keep.append(c)
+    if not keep:
+        keep = [_FALLBACK]
+    return keep
+
+
+def _bench(qs, ks, vs, os_, qk_scale, causal, cfg, reps):
+    _launch(qs, ks, vs, os_, qk_scale, causal, cfg)
+    torch.cuda.synchronize()
+    start = torch.cuda.Event(enable_timing=True)
+    end = torch.cuda.Event(enable_timing=True)
+    best = float("inf")
+    for _ in range(reps):
+        start.record()
+        _launch(qs, ks, vs, os_, qk_scale, causal, cfg)
+        end.record()
+        torch.cuda.synchronize()
+        t = start.elapsed_time(end)
+        if t < best:
+            best = t
+    return best
+
+
+def _matches(ref, out):
+    r = ref.to(torch.float32)
+    o = out.to(torch.float32)
+    d = (o - r).abs().max().item()
+    s = r.abs().max().item()
+    if not (d == d):
+        return False
+    tol = 5.0e-3 * s
+    if tol < 1.0e-3:
+        tol = 1.0e-3
+    return d < tol
+
+
+def _select_cfg(q, k, v, out, qk_scale, causal, cands):
+    B, H, N, D = q.shape
+
+    nb = 32768
+    if N > nb:
+        hb = 8 if H >= 8 else H
+        qs = q[:1, :hb, :nb, :].contiguous()
+        ks = k[:1, :hb, :nb, :].contiguous()
+        vs = v[:1, :hb, :nb, :].contiguous()
+        os_ = torch.empty((1, hb, nb, D), device=q.device, dtype=q.dtype)
+        reps = 3
+    else:
+        qs, ks, vs, os_ = q, k, v, out
+        reps = 3 if N > 8192 else 5
+
+    ref = None
+    ref_cfg = _FALLBACK if (N % 128 == 0 and N % 64 == 0) else None
+    if ref_cfg is not None:
+        try:
+            ref = torch.empty_like(os_)
+            _launch(qs, ks, vs, ref, qk_scale, causal, ref_cfg)
+            torch.cuda.synchronize()
+        except Exception:
+            ref = None
+
+    best, best_t = None, float("inf")
+    for cfg in cands:
+        try:
+            t = _bench(qs, ks, vs, os_, qk_scale, causal, cfg, reps)
+            if ref is not None and not _matches(ref, os_):
+                continue
+        except Exception:
+            continue
+        if t < best_t:
+            best_t, best = t, cfg
+
+    if best is None:
+        best = cands[-1]
+    return best
+
+
+def kernel_function(q: torch.Tensor,
+                    k: torch.Tensor,
+                    v: torch.Tensor,
+                    is_causal: bool = True,
+                    sm_scale: float | None = None) -> torch.Tensor:
+    """
+    Causal scaled-dot-product attention, fully fused into one Triton kernel.
+
+    Args:
+        q, k, v:   [B, H, N, D] fp16/bf16 CUDA tensors.
+        is_causal: apply causal masking (default True).
+        sm_scale:  softmax scale, defaults to 1/sqrt(D).
+
+    Returns:
+        Output tensor [B, H, N, D] with the same dtype as `q`.
+    """
+    assert q.is_cuda and k.is_cuda and v.is_cuda, "inputs must live on CUDA"
+    assert q.dim() == k.dim() == v.dim() == 4, "expected [B, H, N, D] tensors"
+    assert q.shape == k.shape == v.shape, "q/k/v must have identical shapes"
+    assert q.dtype == k.dtype == v.dtype, "q/k/v must share a dtype"
+    assert q.dtype in (torch.float16, torch.bfloat16), "fp16/bf16 only"
+
+    if q.stride(-1) != 1:
+        q = q.contiguous()
+    if k.stride(-1) != 1:
+        k = k.contiguous()
+    if v.stride(-1) != 1:
+        v = v.contiguous()
+
+    B, H, N, D = q.shape
+    assert D in (16, 32, 64, 128, 256), f"unsupported head_dim {D}"
+
+    if sm_scale is None:
+        sm_scale = 1.0 / (D ** 0.5)
+    qk_scale = float(sm_scale) * _LOG2E   # fold 1/ln(2) -> exp2
+
+    out = torch.empty_like(q)
+    causal = bool(is_causal)
+
+    tma_ok = (q.is_contiguous() and k.is_contiguous() and v.is_contiguous()
+              and out.is_contiguous())
+
+    key = (B, H, N, D, causal, q.dtype, q.device.index, tma_ok)
+    cfg = _BEST_CFG.get(key)
+    if cfg is None:
+        cands = _candidate_configs(N, D, tma_ok, causal)
+        if len(cands) == 1:
+            cfg = cands[0]
+        else:
+            cfg = _select_cfg(q, k, v, out, qk_scale, causal, cands)
+        _BEST_CFG[key] = cfg
+
+    try:
+        _launch(q, k, v, out, qk_scale, causal, cfg)
+    except Exception:
+        cfg = _FALLBACK if N >= 256 else _candidate_configs(N, D, False,
+                                                            causal)[0]
+        _BEST_CFG[key] = cfg
+        _launch(q, k, v, out, qk_scale, causal, cfg)
+
+    return out

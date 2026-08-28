@@ -1,0 +1,775 @@
+from __future__ import annotations
+
+import argparse
+import contextlib
+import hashlib
+import importlib.metadata
+import json
+import os
+from pathlib import Path
+import shutil
+import signal
+import subprocess
+import sys
+import time
+from typing import Any
+
+VERSION = "v3-20260730"
+MODEL = "gpt-5.6-sol"
+SEED = 2026080106
+ARCHIVE_SHA256 = "258853a7f19046f0cd3a3cc74564514f2756d24b54b1fbd7efa60f38d9a26e0b"
+BINARY_SHA256 = "2859181c5786a782d8946032967a5ee70a9bf191e272137c97703a12550330c0"
+_ACTIVE_PROCESS_GROUPS: set[int] = set()
+_RESTORE_SIGNAL_MASK_CODE = (
+    "import os,signal,sys;"
+    "signal.pthread_sigmask(signal.SIG_SETMASK,"
+    "{int(value) for value in sys.argv[1].split(',') if value});"
+    "os.execvpe(sys.argv[2],sys.argv[2:],os.environ)"
+)
+
+
+def _command_restoring_signal_mask(
+    command: list[str], previous_mask: set[signal.Signals]
+) -> list[str]:
+    serialized_mask = ",".join(str(int(value)) for value in sorted(previous_mask))
+    return [sys.executable, "-c", _RESTORE_SIGNAL_MASK_CODE, serialized_mask, *command]
+
+
+def _required_environment(name: str) -> str:
+    value = os.environ.get(name)
+    if not value:
+        raise RuntimeError(f"{name} is required")
+    return value
+
+
+def _sha256(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        while chunk := handle.read(1024 * 1024):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _write_json(path: Path, payload: object) -> None:
+    temporary = path.with_suffix(path.suffix + ".tmp")
+    temporary.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n")
+    temporary.replace(path)
+
+
+def _gpu_power_limit(physical_gpu: int) -> float:
+    output = subprocess.check_output(
+        [
+            "nvidia-smi",
+            "-i",
+            str(physical_gpu),
+            "--query-gpu=power.limit",
+            "--format=csv,noheader,nounits",
+        ],
+        text=True,
+    )
+    return float(output.strip())
+
+
+def _assert_gpu_ready(physical_gpu: int) -> None:
+    power = _gpu_power_limit(physical_gpu)
+    if abs(power - 750.0) > 0.5:
+        raise RuntimeError(
+            f"GPU {physical_gpu} power limit is {power} W; expected 750 W"
+        )
+    output = subprocess.check_output(
+        [
+            "nvidia-smi",
+            "-i",
+            str(physical_gpu),
+            "--query-compute-apps=pid",
+            "--format=csv,noheader",
+        ],
+        text=True,
+    ).strip()
+    if output:
+        raise RuntimeError(
+            f"GPU {physical_gpu} has active compute process(es): {output}"
+        )
+
+
+def _config_text() -> str:
+    base_url = json.dumps(_required_environment("KERNELAGENT_OPENAI_BASE_URL"))
+    template = """default_model = "gpt-5.6-sol"
+default_thinking = true
+default_yolo = false
+default_editor = ""
+
+[providers.meta_azure]
+type = "openai_responses"
+base_url = __OPENAI_BASE_URL__
+api_key = "unused"
+query_params = { api-version = "v1" }
+
+[models."gpt-5.6-sol"]
+provider = "meta_azure"
+model = "gpt-5.6-sol-ptu"
+max_context_size = 1000000
+capabilities = ["thinking"]
+thinking_effort = "xhigh"
+
+[loop_control]
+max_steps_per_turn = 500
+max_retries_per_step = 3
+max_ralph_iterations = -1
+reserved_context_size = 50000
+compaction_trigger_ratio = 0.85
+
+[services]
+
+[mcp.client]
+tool_call_timeout_ms = 480000
+"""
+    return template.replace("__OPENAI_BASE_URL__", base_url)
+
+
+def _task_prompt(
+    seq_len: int, causal: bool, budget_seconds: float, budget_label: str
+) -> str:
+    return f"""Optimize the following fixed attention-forward task on NVIDIA B200 (SM100) at a 750 W power limit.
+
+Inputs: three independent contiguous torch.float16 CUDA tensors q, k, v with shape [2, 32, {seq_len}, 64].
+Output: exactly torch.nn.functional.scaled_dot_product_attention(q, k, v, is_causal={causal!r}) using the default scale 1/sqrt(64), output only (no LSE).
+Candidate contract: complete self-contained CuTeDSL Python source defining kernel_function(q, k, v) and a @cute.kernel device kernel.
+Correctness: full-output comparison to the PyTorch/cuDNN reference at atol=5e-2 and rtol=2e-2 on two independent cases before every accepted timing: standard normal q/k/v, and a stress case with 2x q/k plus a random per-head/per-feature value offset.
+Metric: median CUDA-event runtime and the standard QK+PV attention FLOP model.
+Budget: {budget_seconds:.1f} seconds total wall clock ({budget_label} the corresponding Helion tuning time), including model reasoning, reference inspection, compilation, correctness, profiling, and candidate timing.
+
+The PyTorch expression above is the only attention task reference. The controlled read tools also expose the closed binary's bundled B200 FlashKDA and PTX material, as approved by the user, plus generic Blackwell FP16 GEMM tutorials from CUTLASS commit da5e086d for CuTeDSL API syntax (executed with CUTLASS DSL 4.5.1). These are reference-only and may not be runtime dependencies. There is no attention implementation in the controlled references. The campaign is fresh and contains no Helion or FlashAttention source, caches, kernels, or prior-run history.
+
+Scalar attention is rejected because it cannot execute these long sequences within the budget. Call campaign_status now and inspect the generic tensor-core examples as needed. Use test_candidate first and fix every compiler or numerical error until the complete source passes both full-output distributions. Then call submit_candidate with that identical source for authoritative revalidation and timing. Only optimize from a correctness-passing source, retesting each changed source before submission. Continue until the deadline rather than ending after a plan or explanation.
+"""
+
+
+def _agent_environment(run_dir: Path) -> dict[str, str]:
+    environment = os.environ.copy()
+    base_url = _required_environment("KERNELAGENT_OPENAI_BASE_URL")
+    ca_certificate = _required_environment("KERNELAGENT_OPENAI_CA_CERTIFICATE")
+    no_proxy = environment.get("KERNELAGENT_OPENAI_NO_PROXY", "127.0.0.1,localhost")
+    certificate = environment.get("CODEX_CLIENT_CERT") or environment.get(
+        "THRIFT_TLS_CL_CERT_PATH"
+    )
+    key = environment.get("CODEX_CLIENT_KEY") or environment.get(
+        "THRIFT_TLS_CL_KEY_PATH"
+    )
+    if not certificate or not key:
+        raise RuntimeError("GPT-5.6 mTLS client certificate environment is missing")
+    environment.update(
+        {
+            "HOME": str(run_dir / "agent-home"),
+            "KERNELAGENT_SHARE_DIR": str(run_dir / "kernelagent-history"),
+            "OPENAI_CA_CERTIFICATE": ca_certificate,
+            "OPENAI_CLIENT_CERTIFICATE": certificate,
+            "OPENAI_CLIENT_PRIVATE_KEY": key,
+            "OPENAI_BASE_URL": base_url,
+            "NO_PROXY": no_proxy,
+            "no_proxy": no_proxy,
+        }
+    )
+    return environment
+
+
+def _terminate_process_group(process: subprocess.Popen[str]) -> None:
+    if process.poll() is not None:
+        return
+    try:
+        os.killpg(process.pid, signal.SIGTERM)
+    except ProcessLookupError:
+        return
+    try:
+        process.wait(timeout=15)
+    except subprocess.TimeoutExpired:
+        with contextlib.suppress(ProcessLookupError):
+            os.killpg(process.pid, signal.SIGKILL)
+        with contextlib.suppress(subprocess.TimeoutExpired):
+            process.wait(timeout=5)
+
+
+def _terminate_active_process_groups() -> None:
+    for process_group in tuple(_ACTIVE_PROCESS_GROUPS):
+        with contextlib.suppress(ProcessLookupError):
+            os.killpg(process_group, signal.SIGTERM)
+    deadline = time.monotonic() + 3
+    while _ACTIVE_PROCESS_GROUPS and time.monotonic() < deadline:
+        for process_group in tuple(_ACTIVE_PROCESS_GROUPS):
+            try:
+                os.killpg(process_group, 0)
+            except ProcessLookupError:
+                _ACTIVE_PROCESS_GROUPS.discard(process_group)
+        if _ACTIVE_PROCESS_GROUPS:
+            time.sleep(0.1)
+    for process_group in tuple(_ACTIVE_PROCESS_GROUPS):
+        with contextlib.suppress(ProcessLookupError):
+            os.killpg(process_group, signal.SIGKILL)
+
+
+def _handle_signal(signum: int, _frame: object) -> None:
+    signal.signal(signum, signal.SIG_DFL)
+    _terminate_active_process_groups()
+    raise SystemExit(128 + signum)
+
+
+def _run_agent(
+    args: argparse.Namespace,
+    run_dir: Path,
+    deadline: float,
+    mcp_config: Path,
+    config: Path,
+    prompt: str,
+) -> list[int]:
+    setup_root = Path(__file__).resolve().parent
+    environment = _agent_environment(run_dir)
+    stdout_path = run_dir / "kernelagent_stdout.jsonl"
+    stderr_path = run_dir / "kernelagent_stderr.log"
+    exit_codes = []
+    first = True
+    while deadline - time.time() > 5:
+        command = [
+            str(args.binary.resolve()),
+            "--config-file",
+            str(config),
+            "--work-dir",
+            str(run_dir / "workspace"),
+            "--agent-file",
+            str(setup_root / "agent.yaml"),
+            "--mcp-config-file",
+            str(mcp_config),
+            "--print",
+            "--output-format",
+            "stream-json",
+            "--max-steps-per-turn",
+            "500",
+            "--max-ralph-iterations",
+            "-1",
+        ]
+        if first:
+            command.extend(["--prompt", prompt])
+        else:
+            sessions = sorted(
+                (run_dir / "kernelagent-history" / "sessions").glob("*/*"),
+                key=lambda path: path.stat().st_mtime,
+            )
+            if sessions:
+                command.extend(["--session", sessions[-1].name])
+            else:
+                command.append("--continue")
+            command.extend(
+                [
+                    "--prompt",
+                    (
+                        "Continue the same approved optimization campaign. Check "
+                        "campaign_status and keep submitting CuTeDSL candidates "
+                        "until the fixed deadline."
+                    ),
+                ]
+            )
+        with stdout_path.open("a") as stdout, stderr_path.open("a") as stderr:
+            previous_mask = signal.pthread_sigmask(
+                signal.SIG_BLOCK, {signal.SIGINT, signal.SIGTERM}
+            )
+            try:
+                process = subprocess.Popen(
+                    _command_restoring_signal_mask(command, previous_mask),
+                    cwd=run_dir / "workspace",
+                    env=environment,
+                    stdout=stdout,
+                    stderr=stderr,
+                    text=True,
+                    start_new_session=True,
+                )
+                _ACTIVE_PROCESS_GROUPS.add(process.pid)
+            finally:
+                signal.pthread_sigmask(signal.SIG_SETMASK, previous_mask)
+            try:
+                process.wait(timeout=max(1.0, deadline - time.time()))
+            except subprocess.TimeoutExpired:
+                _terminate_process_group(process)
+                exit_codes.append(process.returncode or -signal.SIGTERM)
+                break
+            finally:
+                _ACTIVE_PROCESS_GROUPS.discard(process.pid)
+        exit_codes.append(process.returncode or 0)
+        first = False
+        if deadline - time.time() > 10:
+            time.sleep(1)
+    return exit_codes
+
+
+def _usage_from_history(history_root: Path) -> dict[str, int]:
+    by_message: dict[str, dict[str, int]] = {}
+    anonymous_index = 0
+    for path in history_root.rglob("wire.jsonl"):
+        for line in path.read_text(errors="replace").splitlines():
+            try:
+                record = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            message = record.get("message", {})
+            if message.get("type") != "StatusUpdate":
+                continue
+            payload = message.get("payload", {})
+            usage = payload.get("token_usage")
+            if not isinstance(usage, dict):
+                continue
+            message_id = payload.get("message_id")
+            if not message_id:
+                anonymous_index += 1
+                message_id = f"anonymous-{anonymous_index}"
+            by_message[str(message_id)] = {
+                key: int(value)
+                for key, value in usage.items()
+                if isinstance(value, (int, float))
+            }
+    totals = {
+        "model_calls": len(by_message),
+        "input_other_tokens": 0,
+        "input_cache_creation_tokens": 0,
+        "input_cache_read_tokens": 0,
+        "output_tokens": 0,
+    }
+    keys = {
+        "input_other": "input_other_tokens",
+        "input_cache_creation": "input_cache_creation_tokens",
+        "input_cache_read": "input_cache_read_tokens",
+        "output": "output_tokens",
+    }
+    for usage in by_message.values():
+        for source, target in keys.items():
+            totals[target] += int(usage.get(source, 0))
+    totals["total_tokens"] = sum(
+        totals[key]
+        for key in (
+            "input_other_tokens",
+            "input_cache_creation_tokens",
+            "input_cache_read_tokens",
+            "output_tokens",
+        )
+    )
+    return totals
+
+
+def _sandbox_environment(
+    run_dir: Path, setup_root: Path, physical_gpu: int
+) -> dict[str, str]:
+    environment = os.environ.copy()
+    environment.update(
+        {
+            "KERNELAGENT_ALLOWED_RUN_ROOT": str(run_dir),
+            "KERNELAGENT_SETUP_ROOT": str(setup_root),
+            "KERNELAGENT_PHYSICAL_GPU": str(physical_gpu),
+        }
+    )
+    return environment
+
+
+def _parse_evaluator_result(stdout: str) -> dict[str, Any]:
+    marker = "KERNELAGENT_RESULT="
+    for line in reversed(stdout.splitlines()):
+        if line.startswith(marker):
+            return json.loads(line[len(marker) :])
+    raise RuntimeError("final evaluator produced no result marker")
+
+
+def _final_measurement_timeout(seq_len: int) -> int:
+    if seq_len >= 524288:
+        return 3600
+    if seq_len >= 262144:
+        return 1800
+    return 900
+
+
+def _run_final_measurement(
+    run_dir: Path,
+    source: Path,
+    seq_len: int,
+    causal: bool,
+    physical_gpu: int,
+) -> dict[str, Any]:
+    setup_root = Path(__file__).resolve().parent
+    command = [
+        str(setup_root / "sandbox_launcher.sh"),
+        str(setup_root / "evaluate_candidate.py.txt"),
+        "--source",
+        str(source),
+        "--seq-len",
+        str(seq_len),
+        "--causal",
+        str(int(causal)),
+        "--mode",
+        "final",
+    ]
+    previous_mask = signal.pthread_sigmask(
+        signal.SIG_BLOCK, {signal.SIGINT, signal.SIGTERM}
+    )
+    try:
+        process = subprocess.Popen(
+            _command_restoring_signal_mask(command, previous_mask),
+            cwd=run_dir,
+            env=_sandbox_environment(run_dir, setup_root, physical_gpu),
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            start_new_session=True,
+        )
+        _ACTIVE_PROCESS_GROUPS.add(process.pid)
+    finally:
+        signal.pthread_sigmask(signal.SIG_SETMASK, previous_mask)
+    timeout = _final_measurement_timeout(seq_len)
+    try:
+        stdout, stderr = process.communicate(timeout=timeout)
+    except subprocess.TimeoutExpired:
+        _terminate_process_group(process)
+        raise RuntimeError(
+            f"final selected-kernel measurement exceeded {timeout}s"
+        ) from None
+    finally:
+        _ACTIVE_PROCESS_GROUPS.discard(process.pid)
+    result = _parse_evaluator_result(stdout)
+    if process.returncode != 0 or result.get("status") != "PASS":
+        raise RuntimeError(
+            "final selected-kernel verification failed: "
+            f"exit={process.returncode}, result={result}, stderr={stderr[-4000:]}"
+        )
+    return result
+
+
+def _benchmark_result(
+    args: argparse.Namespace,
+    manifest: dict[str, Any],
+    final: dict[str, Any],
+    source_hash: str,
+) -> dict[str, Any]:
+    best_ms = float(final["best_ms"])
+    median_ms = float(final["median_ms"])
+    flops = 4.0 * 2 * 32 * args.seq_len * args.seq_len * 64
+    if args.causal:
+        flops /= 2.0
+    selection = manifest["selection"]
+    return {
+        "impl": f"kernelagent-closed-{args.budget_label}",
+        "version": (
+            f"KernelAgent Closed Binary {VERSION}; GPT-5.6; "
+            f"CUTLASS DSL {manifest['cutlass_dsl_version']}"
+        ),
+        "version_label": f"KernelAgent Closed Binary {VERSION} / GPT-5.6",
+        "shape": {
+            "z": 2,
+            "h": 32,
+            "seq_len": args.seq_len,
+            "head_dim": 64,
+            "dtype": "float16",
+            "causal": int(bool(args.causal)),
+            "biased": 0,
+        },
+        "gpu": "NVIDIA B200",
+        "physical_gpu": str(args.physical_gpu),
+        "power_cap_w": 750,
+        "flop_model": "softmax_attention_forward",
+        "accuracy": "PASS",
+        "benchmark_timer": "event",
+        "best_ms": best_ms,
+        "median_ms": median_ms,
+        "mom_median_ms": median_ms,
+        "mean_ms": float(final["mean_ms"]),
+        "std_ms": float(final["std_ms"]),
+        "runs_ms": final["runs_ms"],
+        "best_tflops": flops / (best_ms * 1e9),
+        "median_tflops": flops / (median_ms * 1e9),
+        "mom_median_tflops": flops / (median_ms * 1e9),
+        "config": {
+            "budget_label": args.budget_label,
+            "budget_seconds": args.budget_seconds,
+            "elapsed_seconds": manifest["elapsed_seconds"],
+            "selection": selection,
+            "source_sha256": source_hash,
+        },
+        "notes": [
+            (
+                f"KernelAgent Closed Binary wall-clock tuning budget "
+                f"{args.budget_seconds:.1f}s ({args.budget_label}); elapsed "
+                f"{manifest['elapsed_seconds']:.1f}s."
+            ),
+            (
+                f"Selected source sha256 {source_hash}; candidate "
+                f"{selection['candidate_id']}; internal search time "
+                f"{selection['median_ms']} ms."
+            ),
+            (
+                "GPT-5.6 had only a controlled CuTeDSL campaign MCP; no shell, "
+                "web, arbitrary file, subagent, Helion, or FlashAttention access. "
+                "Generated kernels ran in a network-isolated sandbox."
+            ),
+        ],
+    }
+
+
+def _record_selection(
+    args: argparse.Namespace,
+    run_dir: Path,
+    manifest: dict[str, Any],
+    state: dict[str, Any],
+    elapsed: float,
+    exit_codes: list[int],
+) -> tuple[Path, str]:
+    best_id = state.get("best_candidate_id")
+    if best_id is None:
+        raise RuntimeError(
+            f"KernelAgent produced no verified candidate in {elapsed:.1f}s"
+        )
+    best = next(
+        item for item in state["submissions"] if item["candidate_id"] == best_id
+    )
+    source = Path(best["source_path"])
+    selected = run_dir / "selected_kernel.py.txt"
+    shutil.copy2(source, selected)
+    source_hash = _sha256(selected)
+    usage = _usage_from_history(run_dir / "kernelagent-history")
+    manifest.update(
+        {
+            "elapsed_seconds": elapsed,
+            "agent_exit_codes": exit_codes,
+            "submission_count": len(state["submissions"]),
+            "correctness_check_count": len(state.get("correctness_checks", [])),
+            "correctness_pass_count": sum(
+                item.get("status") == "PASS"
+                for item in state.get("correctness_checks", [])
+            ),
+            "verified_submission_count": sum(
+                item.get("status") == "PASS" for item in state["submissions"]
+            ),
+            "selection": {
+                "candidate_id": best["candidate_id"],
+                "source_sha256": source_hash,
+                "median_ms": best["median_ms"],
+                "tflops": best["tflops"],
+                "hypothesis": best["hypothesis"],
+                "mutation_family": best["mutation_family"],
+            },
+            "token_usage": usage,
+            "provider_reported_cost_usd": None,
+        }
+    )
+    _write_json(run_dir / "manifest.json", manifest)
+    return selected, source_hash
+
+
+def _finish_selected_run(
+    args: argparse.Namespace,
+    run_dir: Path,
+    manifest: dict[str, Any],
+    selected: Path,
+    source_hash: str,
+) -> None:
+    final = _run_final_measurement(
+        run_dir,
+        selected,
+        args.seq_len,
+        bool(args.causal),
+        args.physical_gpu,
+    )
+    manifest.update(
+        {
+            "final_measurement": final,
+            "completed_time_unix": time.time(),
+        }
+    )
+    _write_json(run_dir / "manifest.json", manifest)
+    result = _benchmark_result(args, manifest, final, source_hash)
+    _write_json(run_dir / "benchmark_result.json", result)
+    print(json.dumps(manifest, indent=2, sort_keys=True))
+
+
+def resume_selected(args: argparse.Namespace) -> None:
+    run_dir = args.run_dir.resolve()
+    result_path = run_dir / "benchmark_result.json"
+    if result_path.exists():
+        raise RuntimeError(f"selected run is already complete: {run_dir}")
+    manifest_path = run_dir / "manifest.json"
+    state_path = run_dir / "campaign_state.json"
+    if not manifest_path.is_file() or not state_path.is_file():
+        raise RuntimeError(f"selected run is incomplete: {run_dir}")
+    if _sha256(args.archive.resolve()) != ARCHIVE_SHA256:
+        raise RuntimeError(
+            "closed-binary archive SHA256 does not match inspected artifact"
+        )
+    if _sha256(args.binary.resolve()) != BINARY_SHA256:
+        raise RuntimeError(
+            "KernelAgent binary SHA256 does not match inspected artifact"
+        )
+    _assert_gpu_ready(args.physical_gpu)
+    manifest = json.loads(manifest_path.read_text())
+    state = json.loads(state_path.read_text())
+    elapsed = float(manifest.get("elapsed_seconds", args.budget_seconds))
+    exit_codes = [int(code) for code in manifest.get("agent_exit_codes", [])]
+    manifest["finalization_resume"] = {
+        "resumed_at_unix": time.time(),
+        "model_rerun": False,
+    }
+    selected, source_hash = _record_selection(
+        args,
+        run_dir,
+        manifest,
+        state,
+        elapsed,
+        exit_codes,
+    )
+    _finish_selected_run(args, run_dir, manifest, selected, source_hash)
+
+
+def supervise(args: argparse.Namespace) -> None:
+    run_dir = args.run_dir.resolve()
+    if run_dir.exists():
+        raise RuntimeError(f"run directory already exists: {run_dir}")
+    run_dir.mkdir(parents=True)
+    for child in ("agent-home", "kernelagent-history", "workspace"):
+        (run_dir / child).mkdir()
+
+    binary = args.binary.resolve()
+    archive = args.archive.resolve()
+    reference_root = args.reference_root.resolve()
+    if _sha256(archive) != ARCHIVE_SHA256:
+        raise RuntimeError(
+            "closed-binary archive SHA256 does not match inspected artifact"
+        )
+    if _sha256(binary) != BINARY_SHA256:
+        raise RuntimeError(
+            "KernelAgent binary SHA256 does not match inspected artifact"
+        )
+    if not reference_root.is_dir():
+        raise RuntimeError(f"reference root does not exist: {reference_root}")
+    _assert_gpu_ready(args.physical_gpu)
+
+    config = run_dir / "kernelagent_config.toml"
+    config.write_text(_config_text())
+    start_unix = time.time()
+    deadline = start_unix + args.budget_seconds
+    mcp_config = run_dir / "mcp_config.json"
+    setup_root = Path(__file__).resolve().parent
+    _write_json(
+        mcp_config,
+        {
+            "mcpServers": {
+                "attention_campaign": {
+                    "command": sys.executable,
+                    "args": [
+                        str(setup_root / "campaign_mcp.py.txt"),
+                        "--run-dir",
+                        str(run_dir),
+                        "--reference-root",
+                        str(reference_root),
+                        "--seq-len",
+                        str(args.seq_len),
+                        "--causal",
+                        str(int(bool(args.causal))),
+                        "--physical-gpu",
+                        str(args.physical_gpu),
+                        "--deadline",
+                        str(deadline),
+                    ],
+                }
+            }
+        },
+    )
+    prompt = _task_prompt(
+        args.seq_len,
+        bool(args.causal),
+        args.budget_seconds,
+        args.budget_label,
+    )
+    (run_dir / "task_prompt.txt").write_text(prompt)
+    manifest: dict[str, Any] = {
+        "kernelagent_family": "closed_binary",
+        "kernelagent_version": VERSION,
+        "kernelagent_archive_sha256": ARCHIVE_SHA256,
+        "kernelagent_binary_sha256": BINARY_SHA256,
+        "model": MODEL,
+        "model_endpoint_name": "gpt-5.6-sol-ptu",
+        "thinking_effort": "xhigh",
+        "seq_len": args.seq_len,
+        "causal": bool(args.causal),
+        "physical_gpu": args.physical_gpu,
+        "budget_label": args.budget_label,
+        "budget_seconds": args.budget_seconds,
+        "seed": SEED,
+        "correctness": {
+            "standard_seed": SEED,
+            "stress_seed": SEED + 1,
+            "stress_qk_scale": 2.0,
+            "stress_value_offset": "random per batch/head/feature",
+            "atol": 5e-2,
+            "rtol": 2e-2,
+            "comparison": "full output against PyTorch cuDNN SDPA",
+        },
+        "power_cap_w": 750,
+        "python_version": sys.version.split()[0],
+        "torch_version": importlib.metadata.version("torch"),
+        "triton_version": importlib.metadata.version("triton"),
+        "cutlass_dsl_version": importlib.metadata.version("nvidia-cutlass-dsl"),
+        "reference_root_sha256": {
+            str(path.relative_to(reference_root)): _sha256(path)
+            for path in sorted(reference_root.rglob("*"))
+            if path.is_file()
+        },
+        "tool_policy": {
+            "agent_builtin_tools": [],
+            "mcp_tools": [
+                "campaign_status",
+                "list_references",
+                "read_reference",
+                "search_references",
+                "test_candidate",
+                "submit_candidate",
+                "get_best_source",
+                "profile_best",
+            ],
+            "candidate_network": "disabled by Linux network namespace",
+            "candidate_backend": "CuTeDSL only",
+        },
+        "start_time_unix": start_unix,
+    }
+    _write_json(run_dir / "manifest.json", manifest)
+
+    exit_codes = _run_agent(args, run_dir, deadline, mcp_config, config, prompt)
+    elapsed = time.time() - start_unix
+    state_path = run_dir / "campaign_state.json"
+    if not state_path.exists():
+        raise RuntimeError("KernelAgent produced no campaign state")
+    state = json.loads(state_path.read_text())
+    selected, source_hash = _record_selection(
+        args,
+        run_dir,
+        manifest,
+        state,
+        elapsed,
+        exit_codes,
+    )
+    _finish_selected_run(args, run_dir, manifest, selected, source_hash)
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--run-dir", type=Path, required=True)
+    parser.add_argument("--archive", type=Path, required=True)
+    parser.add_argument("--binary", type=Path, required=True)
+    parser.add_argument("--reference-root", type=Path, required=True)
+    parser.add_argument("--seq-len", type=int, required=True)
+    parser.add_argument("--causal", type=int, choices=(0, 1), required=True)
+    parser.add_argument("--physical-gpu", type=int, choices=(6, 7), required=True)
+    parser.add_argument("--budget-seconds", type=float, required=True)
+    parser.add_argument("--budget-label", choices=("1x", "2x"), default="1x")
+    parser.add_argument("--resume-selected", action="store_true")
+    return parser.parse_args()
+
+
+if __name__ == "__main__":
+    signal.signal(signal.SIGINT, _handle_signal)
+    signal.signal(signal.SIGTERM, _handle_signal)
+    arguments = parse_args()
+    if arguments.resume_selected:
+        resume_selected(arguments)
+    else:
+        supervise(arguments)

@@ -1,0 +1,542 @@
+from __future__ import annotations
+
+import torch
+import triton
+import triton.language as tl
+
+_LOG2E = 1.4426950408889634
+
+
+# ---------------------------------------------------------------------------
+# online-softmax + PV accumulation for one (already scaled) score tile
+# ---------------------------------------------------------------------------
+@triton.jit
+def _sm_step(qk, m_i, l_i, acc, v):
+    m_ij = tl.maximum(m_i, tl.max(qk, 1))
+    p = tl.math.exp2(qk - m_ij[:, None])
+    alpha = tl.math.exp2(m_i - m_ij)
+    l_i = l_i * alpha + tl.sum(p, 1)
+    acc = acc * alpha[:, None]
+    acc = tl.dot(p.to(v.dtype), v, acc)
+    return m_ij, l_i, acc
+
+
+# ---------------------------------------------------------------------------
+# unmasked streaming loop (no warp specialization)
+# ---------------------------------------------------------------------------
+@triton.jit
+def _inner_plain(acc, l_i, m_i, q, K_bp, V_bp, qk_scale, hi,
+                 BLOCK_N: tl.constexpr, PRESCALE: tl.constexpr):
+    for _ in tl.range(0, hi, BLOCK_N):
+        k = tl.load(K_bp)
+        qk = tl.dot(q, k)
+        if not PRESCALE:
+            qk = qk * qk_scale
+        v = tl.load(V_bp)
+        m_i, l_i, acc = _sm_step(qk, m_i, l_i, acc, v)
+        K_bp = tl.advance(K_bp, (0, BLOCK_N))
+        V_bp = tl.advance(V_bp, (BLOCK_N, 0))
+    return acc, l_i, m_i
+
+
+# ---------------------------------------------------------------------------
+# unmasked streaming loop with Blackwell/Hopper automatic warp specialization
+# ---------------------------------------------------------------------------
+@triton.jit
+def _inner_ws(acc, l_i, m_i, q, K_bp, V_bp, qk_scale, hi,
+              BLOCK_N: tl.constexpr, PRESCALE: tl.constexpr):
+    for _ in tl.range(0, hi, BLOCK_N, warp_specialize=True):
+        k = tl.load(K_bp)
+        qk = tl.dot(q, k)
+        if not PRESCALE:
+            qk = qk * qk_scale
+        v = tl.load(V_bp)
+        m_i, l_i, acc = _sm_step(qk, m_i, l_i, acc, v)
+        K_bp = tl.advance(K_bp, (0, BLOCK_N))
+        V_bp = tl.advance(V_bp, (BLOCK_N, 0))
+    return acc, l_i, m_i
+
+
+# ---------------------------------------------------------------------------
+# manual 1-deep software pipeline: next QK MMA issued before current softmax
+# ---------------------------------------------------------------------------
+@triton.jit
+def _inner_pipe(acc, l_i, m_i, q, K_bp, V_bp, qk_scale, hi,
+                BLOCK_N: tl.constexpr, PRESCALE: tl.constexpr):
+    k = tl.load(K_bp)
+    qk = tl.dot(q, k)
+    if not PRESCALE:
+        qk = qk * qk_scale
+    for _ in tl.range(BLOCK_N, hi, BLOCK_N):
+        K_bp = tl.advance(K_bp, (0, BLOCK_N))
+        kn = tl.load(K_bp)
+        v = tl.load(V_bp)
+        qk_next = tl.dot(q, kn)
+        if not PRESCALE:
+            qk_next = qk_next * qk_scale
+        m_i, l_i, acc = _sm_step(qk, m_i, l_i, acc, v)
+        V_bp = tl.advance(V_bp, (BLOCK_N, 0))
+        qk = qk_next
+    v = tl.load(V_bp)
+    m_i, l_i, acc = _sm_step(qk, m_i, l_i, acc, v)
+    return acc, l_i, m_i
+
+
+# ---------------------------------------------------------------------------
+# fully general (masked / causal) loop
+# ---------------------------------------------------------------------------
+@triton.jit
+def _inner_mask(acc, l_i, m_i, q, K_bp, V_bp, qk_scale, hi,
+                offs_m, offs_n, N_KV, delta,
+                BLOCK_N: tl.constexpr, PRESCALE: tl.constexpr,
+                IS_CAUSAL: tl.constexpr, EVEN_N: tl.constexpr):
+    for start_n in tl.range(0, hi, BLOCK_N):
+        start_n = tl.multiple_of(start_n, BLOCK_N)
+        if EVEN_N:
+            k = tl.load(K_bp)
+        else:
+            k = tl.load(K_bp, boundary_check=(1,), padding_option="zero")
+        qk = tl.dot(q, k)
+        if not PRESCALE:
+            qk = qk * qk_scale
+        n_idx = start_n + offs_n
+        keep = n_idx[None, :] < N_KV
+        if IS_CAUSAL:
+            keep = keep & ((offs_m[:, None] + delta) >= n_idx[None, :])
+        qk = tl.where(keep, qk, -float("inf"))
+        m_ij = tl.maximum(tl.maximum(m_i, tl.max(qk, 1)), -1.0e30)
+        p = tl.math.exp2(qk - m_ij[:, None])
+        alpha = tl.math.exp2(m_i - m_ij)
+        l_i = l_i * alpha + tl.sum(p, 1)
+        acc = acc * alpha[:, None]
+        if EVEN_N:
+            v = tl.load(V_bp)
+        else:
+            v = tl.load(V_bp, boundary_check=(0,), padding_option="zero")
+        acc = tl.dot(p.to(v.dtype), v, acc)
+        m_i = m_ij
+        K_bp = tl.advance(K_bp, (0, BLOCK_N))
+        V_bp = tl.advance(V_bp, (BLOCK_N, 0))
+    return acc, l_i, m_i
+
+
+# ---------------------------------------------------------------------------
+# single query-group kernel
+# ---------------------------------------------------------------------------
+@triton.jit
+def _flash_fwd(
+    Q, K, V, O, qk_scale,
+    stride_qz, stride_qh, stride_qm, stride_qd,
+    stride_kz, stride_kh, stride_kn, stride_kd,
+    stride_vz, stride_vh, stride_vn, stride_vd,
+    stride_oz, stride_oh, stride_om, stride_od,
+    N_CTX, N_KV, H,
+    HEAD_DIM: tl.constexpr,
+    BLOCK_M: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    EVEN_M: tl.constexpr,
+    EVEN_N: tl.constexpr,
+    MASK: tl.constexpr,
+    IS_CAUSAL: tl.constexpr,
+    PRESCALE: tl.constexpr,
+    VARIANT: tl.constexpr,
+):
+    start_m = tl.program_id(0)
+    off_zh = tl.program_id(1)
+    off_z = (off_zh // H).to(tl.int64)
+    off_h = (off_zh % H).to(tl.int64)
+
+    q_base = Q + off_z * stride_qz + off_h * stride_qh
+    k_base = K + off_z * stride_kz + off_h * stride_kh
+    v_base = V + off_z * stride_vz + off_h * stride_vh
+    o_base = O + off_z * stride_oz + off_h * stride_oh
+
+    Q_bp = tl.make_block_ptr(
+        base=q_base, shape=(N_CTX, HEAD_DIM), strides=(stride_qm, stride_qd),
+        offsets=(start_m * BLOCK_M, 0), block_shape=(BLOCK_M, HEAD_DIM),
+        order=(1, 0),
+    )
+    K_bp = tl.make_block_ptr(
+        base=k_base, shape=(HEAD_DIM, N_KV), strides=(stride_kd, stride_kn),
+        offsets=(0, 0), block_shape=(HEAD_DIM, BLOCK_N), order=(0, 1),
+    )
+    V_bp = tl.make_block_ptr(
+        base=v_base, shape=(N_KV, HEAD_DIM), strides=(stride_vn, stride_vd),
+        offsets=(0, 0), block_shape=(BLOCK_N, HEAD_DIM), order=(1, 0),
+    )
+    O_bp = tl.make_block_ptr(
+        base=o_base, shape=(N_CTX, HEAD_DIM), strides=(stride_om, stride_od),
+        offsets=(start_m * BLOCK_M, 0), block_shape=(BLOCK_M, HEAD_DIM),
+        order=(1, 0),
+    )
+
+    if EVEN_M:
+        q = tl.load(Q_bp)
+    else:
+        q = tl.load(Q_bp, boundary_check=(0,), padding_option="zero")
+    if PRESCALE:
+        q = (q.to(tl.float32) * qk_scale).to(q.dtype)
+
+    m_i = tl.full([BLOCK_M], -float("inf"), dtype=tl.float32)
+    l_i = tl.zeros([BLOCK_M], dtype=tl.float32)
+    acc = tl.zeros([BLOCK_M, HEAD_DIM], dtype=tl.float32)
+
+    delta = N_KV - N_CTX
+    if IS_CAUSAL:
+        hi = tl.minimum((start_m + 1) * BLOCK_M + delta, N_KV)
+        hi = tl.maximum(hi, 0)
+    else:
+        hi = N_KV
+
+    if MASK:
+        offs_m = start_m * BLOCK_M + tl.arange(0, BLOCK_M)
+        offs_n = tl.arange(0, BLOCK_N)
+        acc, l_i, m_i = _inner_mask(acc, l_i, m_i, q, K_bp, V_bp, qk_scale, hi,
+                                    offs_m, offs_n, N_KV, delta,
+                                    BLOCK_N, PRESCALE, IS_CAUSAL, EVEN_N)
+    elif VARIANT == 2:
+        acc, l_i, m_i = _inner_pipe(acc, l_i, m_i, q, K_bp, V_bp, qk_scale, hi,
+                                    BLOCK_N, PRESCALE)
+    elif VARIANT == 1:
+        acc, l_i, m_i = _inner_ws(acc, l_i, m_i, q, K_bp, V_bp, qk_scale, hi,
+                                  BLOCK_N, PRESCALE)
+    else:
+        acc, l_i, m_i = _inner_plain(acc, l_i, m_i, q, K_bp, V_bp, qk_scale, hi,
+                                     BLOCK_N, PRESCALE)
+
+    l_safe = tl.where(l_i > 0.0, l_i, 1.0)
+    acc = acc * (1.0 / l_safe)[:, None]
+    out = acc.to(O_bp.dtype.element_ty)
+    if EVEN_M:
+        tl.store(O_bp, out)
+    else:
+        tl.store(O_bp, out, boundary_check=(0,))
+
+
+# ---------------------------------------------------------------------------
+# two query-groups per CTA: halves K/V traffic per query row and gives the
+# scheduler two independent MMA/softmax chains to interleave
+# ---------------------------------------------------------------------------
+@triton.jit
+def _flash_fwd_2g(
+    Q, K, V, O, qk_scale,
+    stride_qz, stride_qh, stride_qm, stride_qd,
+    stride_kz, stride_kh, stride_kn, stride_kd,
+    stride_vz, stride_vh, stride_vn, stride_vd,
+    stride_oz, stride_oh, stride_om, stride_od,
+    N_CTX, N_KV, H,
+    HEAD_DIM: tl.constexpr,
+    BLOCK_M: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    PRESCALE: tl.constexpr,
+    WS: tl.constexpr,
+):
+    pid_m = tl.program_id(0)
+    off_zh = tl.program_id(1)
+    off_z = (off_zh // H).to(tl.int64)
+    off_h = (off_zh % H).to(tl.int64)
+
+    q_base = Q + off_z * stride_qz + off_h * stride_qh
+    k_base = K + off_z * stride_kz + off_h * stride_kh
+    v_base = V + off_z * stride_vz + off_h * stride_vh
+    o_base = O + off_z * stride_oz + off_h * stride_oh
+
+    m0 = pid_m * 2 * BLOCK_M
+    m1 = m0 + BLOCK_M
+
+    Q0 = tl.make_block_ptr(
+        base=q_base, shape=(N_CTX, HEAD_DIM), strides=(stride_qm, stride_qd),
+        offsets=(m0, 0), block_shape=(BLOCK_M, HEAD_DIM), order=(1, 0),
+    )
+    Q1 = tl.make_block_ptr(
+        base=q_base, shape=(N_CTX, HEAD_DIM), strides=(stride_qm, stride_qd),
+        offsets=(m1, 0), block_shape=(BLOCK_M, HEAD_DIM), order=(1, 0),
+    )
+    K_bp = tl.make_block_ptr(
+        base=k_base, shape=(HEAD_DIM, N_KV), strides=(stride_kd, stride_kn),
+        offsets=(0, 0), block_shape=(HEAD_DIM, BLOCK_N), order=(0, 1),
+    )
+    V_bp = tl.make_block_ptr(
+        base=v_base, shape=(N_KV, HEAD_DIM), strides=(stride_vn, stride_vd),
+        offsets=(0, 0), block_shape=(BLOCK_N, HEAD_DIM), order=(1, 0),
+    )
+    O0 = tl.make_block_ptr(
+        base=o_base, shape=(N_CTX, HEAD_DIM), strides=(stride_om, stride_od),
+        offsets=(m0, 0), block_shape=(BLOCK_M, HEAD_DIM), order=(1, 0),
+    )
+    O1 = tl.make_block_ptr(
+        base=o_base, shape=(N_CTX, HEAD_DIM), strides=(stride_om, stride_od),
+        offsets=(m1, 0), block_shape=(BLOCK_M, HEAD_DIM), order=(1, 0),
+    )
+
+    q0 = tl.load(Q0)
+    q1 = tl.load(Q1)
+    if PRESCALE:
+        q0 = (q0.to(tl.float32) * qk_scale).to(q0.dtype)
+        q1 = (q1.to(tl.float32) * qk_scale).to(q1.dtype)
+
+    m_i0 = tl.full([BLOCK_M], -float("inf"), dtype=tl.float32)
+    m_i1 = tl.full([BLOCK_M], -float("inf"), dtype=tl.float32)
+    l_i0 = tl.zeros([BLOCK_M], dtype=tl.float32)
+    l_i1 = tl.zeros([BLOCK_M], dtype=tl.float32)
+    acc0 = tl.zeros([BLOCK_M, HEAD_DIM], dtype=tl.float32)
+    acc1 = tl.zeros([BLOCK_M, HEAD_DIM], dtype=tl.float32)
+
+    hi = N_KV
+    if WS:
+        for _ in tl.range(0, hi, BLOCK_N, warp_specialize=True):
+            k = tl.load(K_bp)
+            qk0 = tl.dot(q0, k)
+            qk1 = tl.dot(q1, k)
+            if not PRESCALE:
+                qk0 = qk0 * qk_scale
+                qk1 = qk1 * qk_scale
+            v = tl.load(V_bp)
+            m_i0, l_i0, acc0 = _sm_step(qk0, m_i0, l_i0, acc0, v)
+            m_i1, l_i1, acc1 = _sm_step(qk1, m_i1, l_i1, acc1, v)
+            K_bp = tl.advance(K_bp, (0, BLOCK_N))
+            V_bp = tl.advance(V_bp, (BLOCK_N, 0))
+    else:
+        for _ in tl.range(0, hi, BLOCK_N):
+            k = tl.load(K_bp)
+            qk0 = tl.dot(q0, k)
+            qk1 = tl.dot(q1, k)
+            if not PRESCALE:
+                qk0 = qk0 * qk_scale
+                qk1 = qk1 * qk_scale
+            v = tl.load(V_bp)
+            m_i0, l_i0, acc0 = _sm_step(qk0, m_i0, l_i0, acc0, v)
+            m_i1, l_i1, acc1 = _sm_step(qk1, m_i1, l_i1, acc1, v)
+            K_bp = tl.advance(K_bp, (0, BLOCK_N))
+            V_bp = tl.advance(V_bp, (BLOCK_N, 0))
+
+    ls0 = tl.where(l_i0 > 0.0, l_i0, 1.0)
+    ls1 = tl.where(l_i1 > 0.0, l_i1, 1.0)
+    acc0 = acc0 * (1.0 / ls0)[:, None]
+    acc1 = acc1 * (1.0 / ls1)[:, None]
+    tl.store(O0, acc0.to(O0.dtype.element_ty))
+    tl.store(O1, acc1.to(O1.dtype.element_ty))
+
+
+# ---------------------------------------------------------------------------
+# launch helpers
+# ---------------------------------------------------------------------------
+_BEST_CFG: dict = {}
+_VMAP = {"plain": 0, "ws": 1, "pipe": 2}
+
+
+def _smem_limit(device: torch.device) -> int:
+    try:
+        props = torch.cuda.get_device_properties(device)
+    except Exception:
+        return 64 * 1024
+    for attr in ("shared_memory_per_block_optin",
+                 "max_shared_memory_per_block_optin",
+                 "shared_memory_per_block"):
+        val = getattr(props, attr, None)
+        if isinstance(val, int) and val > 0:
+            return val
+    return 64 * 1024
+
+
+def _cap_major(device: torch.device) -> int:
+    try:
+        return torch.cuda.get_device_capability(device)[0]
+    except Exception:
+        return 0
+
+
+def _valid(cfg, q, n_ctx, n_kv, is_causal, limit):
+    kind, bm, bn, w, s = cfg
+    d = q.shape[3]
+    elem = q.element_size()
+    ng = 2 if kind.startswith("2g") else 1
+    need = (ng * bm * d + s * 2 * bn * d) * elem
+    if need > int(limit * 0.95):
+        return False
+    if kind == "pipe" and (is_causal or n_kv % bn != 0 or n_kv < 2 * bn):
+        return False
+    if ng == 2 and (is_causal or n_ctx % (2 * bm) != 0 or n_kv % bn != 0):
+        return False
+    return True
+
+
+def _candidates(q, n_ctx, n_kv, is_causal):
+    limit = _smem_limit(q.device)
+    cap = _cap_major(q.device)
+    raw = []
+    if cap >= 9:
+        raw += [("ws", 128, 128, 4, 3), ("ws", 128, 128, 4, 2)]
+    raw += [("plain", 128, 128, 8, 3), ("pipe", 128, 128, 8, 2)]
+    raw += [("2g", 128, 64, 8, 3)]
+    if cap >= 9:
+        raw += [("2gws", 128, 64, 4, 3)]
+    raw += [("plain", 128, 64, 8, 4)]
+    out = [c for c in raw if _valid(c, q, n_ctx, n_kv, is_causal, limit)]
+    if not out:
+        out = [("plain", 64, 32, 4, 2)]
+    return out
+
+
+def _fallbacks(q, n_ctx, n_kv, is_causal):
+    limit = _smem_limit(q.device)
+    raw = [("plain", 128, 128, 8, 2), ("plain", 128, 64, 8, 3),
+           ("plain", 64, 64, 4, 3), ("plain", 64, 32, 4, 2),
+           ("plain", 32, 32, 4, 1)]
+    out = [c for c in raw if _valid(c, q, n_ctx, n_kv, is_causal, limit)]
+    if not out:
+        out = [("plain", 32, 32, 4, 1)]
+    return out
+
+
+def _run(q, k, v, o, qk_scale, is_causal, n_ctx, n_kv, cfg):
+    kind, bm, bn, warps, stages = cfg
+    Z, H = q.shape[0], q.shape[1]
+    d = q.shape[3]
+    prescale = bool(qk_scale <= 1.0)
+    even_n = (n_kv % bn == 0)
+
+    if kind.startswith("2g"):
+        if is_causal or n_ctx % (2 * bm) != 0 or not even_n:
+            raise RuntimeError("2g variant not applicable")
+        grid = (n_ctx // (2 * bm), Z * H, 1)
+        _flash_fwd_2g[grid](
+            q, k, v, o, qk_scale,
+            q.stride(0), q.stride(1), q.stride(2), q.stride(3),
+            k.stride(0), k.stride(1), k.stride(2), k.stride(3),
+            v.stride(0), v.stride(1), v.stride(2), v.stride(3),
+            o.stride(0), o.stride(1), o.stride(2), o.stride(3),
+            n_ctx, n_kv, H,
+            HEAD_DIM=d, BLOCK_M=bm, BLOCK_N=bn,
+            PRESCALE=prescale, WS=(kind == "2gws"),
+            num_warps=warps, num_stages=stages,
+        )
+        return
+
+    even_m = (n_ctx % bm == 0)
+    mask = (not even_n) or bool(is_causal)
+    variant = _VMAP[kind]
+    if variant == 2 and mask:
+        raise RuntimeError("pipe variant not applicable")
+    grid = (triton.cdiv(n_ctx, bm), Z * H, 1)
+    _flash_fwd[grid](
+        q, k, v, o, qk_scale,
+        q.stride(0), q.stride(1), q.stride(2), q.stride(3),
+        k.stride(0), k.stride(1), k.stride(2), k.stride(3),
+        v.stride(0), v.stride(1), v.stride(2), v.stride(3),
+        o.stride(0), o.stride(1), o.stride(2), o.stride(3),
+        n_ctx, n_kv, H,
+        HEAD_DIM=d, BLOCK_M=bm, BLOCK_N=bn,
+        EVEN_M=even_m, EVEN_N=even_n, MASK=mask,
+        IS_CAUSAL=bool(is_causal), PRESCALE=prescale, VARIANT=variant,
+        num_warps=warps, num_stages=stages,
+    )
+
+
+def _time_cfg(q, k, v, o, qk_scale, is_causal, m_b, n_b, cfg, iters=3):
+    try:
+        _run(q, k, v, o, qk_scale, is_causal, m_b, n_b, cfg)
+        torch.cuda.synchronize()
+    except Exception:
+        return float("inf")
+    try:
+        s = torch.cuda.Event(enable_timing=True)
+        e = torch.cuda.Event(enable_timing=True)
+        s.record()
+        for _ in range(iters):
+            _run(q, k, v, o, qk_scale, is_causal, m_b, n_b, cfg)
+        e.record()
+        torch.cuda.synchronize()
+        return s.elapsed_time(e) / iters
+    except Exception:
+        return float("inf")
+
+
+def _select_cfg(q, k, v, qk_scale, is_causal, n_ctx, n_kv, cands):
+    if len(cands) == 1:
+        return cands[0]
+    work = q.shape[0] * q.shape[1] * float(n_ctx) * float(n_kv)
+    if work < 4.0e9:
+        return cands[0]
+    m_b = min(n_ctx, 2048)
+    n_b = min(n_kv, 16384)
+    m_b = (m_b // 256) * 256 if m_b >= 256 else m_b
+    try:
+        o_b = torch.empty((q.shape[0], q.shape[1], m_b, q.shape[3]),
+                          dtype=q.dtype, device=q.device)
+    except Exception:
+        return cands[0]
+    best, best_t = cands[0], float("inf")
+    for c in cands:
+        t = _time_cfg(q, k, v, o_b, qk_scale, is_causal, m_b, n_b, c)
+        if t < best_t:
+            best_t, best = t, c
+    del o_b
+    return best
+
+
+# ---------------------------------------------------------------------------
+# public wrapper
+# ---------------------------------------------------------------------------
+def kernel_function(q: torch.Tensor,
+                    k: torch.Tensor,
+                    v: torch.Tensor,
+                    sm_scale: float | None = None,
+                    is_causal: bool = False) -> torch.Tensor:
+    if not (q.is_cuda and k.is_cuda and v.is_cuda):
+        raise ValueError("q, k, v must be CUDA tensors")
+    if q.dim() != 4 or k.dim() != 4 or v.dim() != 4:
+        raise ValueError("q, k, v must be 4-D [batch, heads, seq, head_dim]")
+    if q.dtype != k.dtype or q.dtype != v.dtype:
+        raise ValueError("q, k, v must share the same dtype")
+    if q.dtype not in (torch.float16, torch.bfloat16, torch.float32):
+        raise ValueError(f"unsupported dtype {q.dtype}")
+
+    Z, H, N_CTX, HEAD_DIM = q.shape
+    Zk, Hk, N_KV, Dk = k.shape
+    Zv, Hv, N_KV_v, Dv = v.shape
+    if (Zk, Hk) != (Z, H) or (Zv, Hv) != (Z, H):
+        raise ValueError("batch/head dims of q, k, v must match")
+    if Dk != HEAD_DIM or Dv != HEAD_DIM:
+        raise ValueError("head_dim of q, k, v must match")
+    if N_KV_v != N_KV:
+        raise ValueError("k and v must have the same sequence length")
+    if HEAD_DIM & (HEAD_DIM - 1) != 0 or HEAD_DIM < 16:
+        raise ValueError("head_dim must be a power of two >= 16")
+
+    if sm_scale is None:
+        sm_scale = 1.0 / (HEAD_DIM ** 0.5)
+    qk_scale = float(sm_scale) * _LOG2E
+
+    out = torch.empty_like(q)
+    if N_CTX == 0 or N_KV == 0:
+        return out
+
+    cands = _candidates(q, N_CTX, N_KV, bool(is_causal))
+    key = (Z, H, N_CTX, N_KV, HEAD_DIM, str(q.dtype), bool(is_causal),
+           round(qk_scale, 6), q.device.index)
+    cfg = _BEST_CFG.get(key)
+    if cfg is None:
+        try:
+            cfg = _select_cfg(q, k, v, qk_scale, bool(is_causal),
+                              N_CTX, N_KV, cands)
+        except Exception:
+            cfg = cands[0]
+        _BEST_CFG[key] = cfg
+
+    order = [cfg]
+    for c in cands + _fallbacks(q, N_CTX, N_KV, bool(is_causal)):
+        if c not in order:
+            order.append(c)
+
+    last_err = None
+    for c in order:
+        try:
+            _run(q, k, v, out, qk_scale, bool(is_causal), N_CTX, N_KV, c)
+            _BEST_CFG[key] = c
+            return out
+        except Exception as err:
+            last_err = err
+            continue
+
+    raise RuntimeError(f"failed to launch flash-attention kernel: {last_err}")

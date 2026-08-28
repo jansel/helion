@@ -1,0 +1,208 @@
+from __future__ import annotations
+
+import torch
+import triton
+import triton.language as tl
+
+
+# ---------------------------------------------------------------------------
+# Single fully-fused causal flash-attention forward kernel.
+#
+# Fused stages (all in one pass over K/V, nothing is materialised to HBM):
+#   1. Q@K^T          (fp16 MMA -> fp32 accumulator)
+#   2. scaling        (folded into Q once, before the loop, in log2 units)
+#   3. causal mask    (only on the diagonal tile; off-diagonal tiles are
+#                      mask-free so the hot loop has zero select ops)
+#   4. online softmax (running max / running denominator, exp2 on SFU)
+#   5. P@V            (fp16 MMA into the same fp32 accumulator)
+#   6. normalisation + fp16 cast + store
+#
+# There is nothing left to fuse into this kernel: the whole operator (a
+# single scaled_dot_product_attention call) is already one kernel launch.
+# ---------------------------------------------------------------------------
+@triton.jit
+def _attn_fwd(Q, K, V, Out,
+              qk_scale,                     # sm_scale * log2(e)
+              H, N_CTX, NUM_M,
+              stride_qz, stride_qh, stride_qm, stride_qk,
+              stride_kz, stride_kh, stride_kn, stride_kk,
+              stride_vz, stride_vh, stride_vn, stride_vk,
+              stride_oz, stride_oh, stride_om, stride_ok,
+              HEAD_DIM: tl.constexpr,
+              BLOCK_M: tl.constexpr,
+              BLOCK_N: tl.constexpr,
+              EVEN: tl.constexpr):
+    # ---- reversed row-block mapping: the longest causal rows are issued
+    #      first so the tail of the launch is the cheap (short) work --------
+    pid = tl.program_id(0)
+    start_m = NUM_M - 1 - pid
+
+    off_hz = tl.program_id(1)
+    off_z = off_hz // H
+    off_h = off_hz % H
+
+    # 64-bit batch/head base offsets (the test tensors hold 2**31 elements),
+    # while all *inside-head* offsets stay 32-bit (max ~3.4e7).
+    z64 = off_z.to(tl.int64)
+    h64 = off_h.to(tl.int64)
+    q_base = Q + z64 * stride_qz + h64 * stride_qh
+    k_base = K + z64 * stride_kz + h64 * stride_kh
+    v_base = V + z64 * stride_vz + h64 * stride_vh
+    o_base = Out + z64 * stride_oz + h64 * stride_oh
+
+    offs_m = start_m * BLOCK_M + tl.arange(0, BLOCK_M)
+    offs_d = tl.arange(0, HEAD_DIM)
+    offs_n = tl.arange(0, BLOCK_N)
+
+    # ---- load Q once and fold the softmax scale (in log2 units) into it ---
+    q_ptrs = q_base + offs_m[:, None] * stride_qm + offs_d[None, :] * stride_qk
+    if EVEN:
+        q = tl.load(q_ptrs)
+    else:
+        q = tl.load(q_ptrs, mask=offs_m[:, None] < N_CTX, other=0.0)
+    q = (q.to(tl.float32) * qk_scale).to(Q.dtype.element_ty)
+
+    m_i = tl.full([BLOCK_M], -float("inf"), tl.float32)
+    l_i = tl.zeros([BLOCK_M], tl.float32)
+    acc = tl.zeros([BLOCK_M, HEAD_DIM], tl.float32)
+
+    # K^T tile is [HEAD_DIM, BLOCK_N] (contiguous along HEAD_DIM),
+    # V tile is [BLOCK_N, HEAD_DIM].
+    kt_ptrs = k_base + (offs_d[:, None] * stride_kk + offs_n[None, :] * stride_kn)
+    v_ptrs = v_base + (offs_n[:, None] * stride_vn + offs_d[None, :] * stride_vk)
+
+    # =================== stage 1: mask-free tiles =========================
+    hi1 = start_m * BLOCK_M
+    for start_n in tl.range(0, hi1, BLOCK_N):
+        kt = tl.load(kt_ptrs)
+        qk = tl.dot(q, kt)                       # already in log2 units
+
+        m_ij = tl.maximum(m_i, tl.max(qk, 1))
+        p = tl.math.exp2(qk - m_ij[:, None])
+        alpha = tl.math.exp2(m_i - m_ij)
+        l_i = l_i * alpha + tl.sum(p, 1)
+
+        v = tl.load(v_ptrs)
+        acc = acc * alpha[:, None]
+        acc = tl.dot(p.to(V.dtype.element_ty), v, acc)
+        m_i = m_ij
+
+        kt_ptrs += BLOCK_N * stride_kn
+        v_ptrs += BLOCK_N * stride_vn
+
+    # =================== stage 2: diagonal tile(s) ========================
+    lo2 = tl.multiple_of(hi1, BLOCK_M)
+    hi2 = tl.minimum(lo2 + BLOCK_M, N_CTX)
+    for start_n in tl.range(lo2, hi2, BLOCK_N):
+        start_n = tl.multiple_of(start_n, BLOCK_N)
+        n_idx = start_n + offs_n
+        kt_p = k_base + (offs_d[:, None] * stride_kk + n_idx[None, :] * stride_kn)
+        if EVEN:
+            kt = tl.load(kt_p)
+            causal = offs_m[:, None] >= n_idx[None, :]
+        else:
+            kt = tl.load(kt_p, mask=n_idx[None, :] < N_CTX, other=0.0)
+            causal = (offs_m[:, None] >= n_idx[None, :]) & (n_idx[None, :] < N_CTX)
+
+        qk = tl.dot(q, kt)
+        qk = qk + tl.where(causal, 0.0, -1.0e6)
+
+        m_ij = tl.maximum(m_i, tl.max(qk, 1))
+        p = tl.math.exp2(qk - m_ij[:, None])
+        alpha = tl.math.exp2(m_i - m_ij)
+        l_i = l_i * alpha + tl.sum(p, 1)
+
+        v_p = v_base + (n_idx[:, None] * stride_vn + offs_d[None, :] * stride_vk)
+        if EVEN:
+            v = tl.load(v_p)
+        else:
+            v = tl.load(v_p, mask=n_idx[:, None] < N_CTX, other=0.0)
+
+        acc = acc * alpha[:, None]
+        acc = tl.dot(p.to(V.dtype.element_ty), v, acc)
+        m_i = m_ij
+
+    # =================== epilogue: normalise + cast + store ===============
+    l_safe = tl.where(l_i > 0.0, l_i, 1.0)
+    acc = acc * (1.0 / l_safe)[:, None]
+
+    o_ptrs = o_base + offs_m[:, None] * stride_om + offs_d[None, :] * stride_ok
+    if EVEN:
+        tl.store(o_ptrs, acc.to(Out.dtype.element_ty))
+    else:
+        tl.store(o_ptrs, acc.to(Out.dtype.element_ty),
+                 mask=offs_m[:, None] < N_CTX)
+
+
+# ---------------------------------------------------------------------------
+# Host side: validation / allocation / launch only (no math).
+#
+# NOTE: no autotuning here on purpose.  This problem is 2.2 PFLOP, so every
+# extra *compilation* (seconds each) is pure overhead against the test's wall
+# clock.  A single well-known-good config for HEAD_DIM<=64 fp16 is used, with
+# a couple of shared-memory-cheaper fallbacks in case a device cannot host it.
+# ---------------------------------------------------------------------------
+# (BLOCK_M, BLOCK_N, num_warps, num_stages)
+_CONFIGS = (
+    (128, 128, 8, 3),
+    (128, 64, 8, 3),
+    (128, 64, 4, 2),
+    (64, 64, 4, 2),
+)
+
+_CHOSEN: dict = {}
+
+_LOG2E = 1.4426950408889634
+
+
+def _launch(q, k, v, out, qk_scale, cfg):
+    BLOCK_M, BLOCK_N, num_warps, num_stages = cfg
+    Z, H, N_CTX, HEAD_DIM = q.shape
+    num_m = triton.cdiv(N_CTX, BLOCK_M)
+    even = (N_CTX % BLOCK_M == 0) and (N_CTX % BLOCK_N == 0)
+    grid = (num_m, Z * H, 1)
+
+    _attn_fwd[grid](
+        q, k, v, out,
+        qk_scale,
+        H, N_CTX, num_m,
+        q.stride(0), q.stride(1), q.stride(2), q.stride(3),
+        k.stride(0), k.stride(1), k.stride(2), k.stride(3),
+        v.stride(0), v.stride(1), v.stride(2), v.stride(3),
+        out.stride(0), out.stride(1), out.stride(2), out.stride(3),
+        HEAD_DIM=HEAD_DIM, BLOCK_M=BLOCK_M, BLOCK_N=BLOCK_N, EVEN=even,
+        num_warps=num_warps, num_stages=num_stages,
+    )
+
+
+def kernel_function(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor) -> torch.Tensor:
+    assert q.is_cuda and k.is_cuda and v.is_cuda, "inputs must live on CUDA"
+    assert q.dim() == 4 and k.dim() == 4 and v.dim() == 4, "expected 4-D [Z,H,N,D]"
+    assert q.shape == k.shape == v.shape, "q/k/v must have identical shapes"
+    assert q.dtype == k.dtype == v.dtype, "q/k/v must have identical dtypes"
+    assert q.dtype in (torch.float16, torch.bfloat16), "expected fp16/bf16 inputs"
+
+    HEAD_DIM = q.shape[-1]
+    assert HEAD_DIM in (16, 32, 64, 128, 256), "unsupported head dim"
+
+    out = torch.empty_like(q)
+    qk_scale = (1.0 / (HEAD_DIM ** 0.5)) * _LOG2E
+
+    key = (HEAD_DIM, q.dtype)
+    cfg = _CHOSEN.get(key)
+    if cfg is not None:
+        _launch(q, k, v, out, qk_scale, cfg)
+        return out
+
+    last_err = None
+    for cfg in _CONFIGS:
+        if cfg[0] > q.shape[2] and q.shape[2] < cfg[0]:
+            pass  # smaller sequences are still handled via masking
+        try:
+            _launch(q, k, v, out, qk_scale, cfg)
+            _CHOSEN[key] = cfg
+            return out
+        except Exception as exc:      # e.g. shared-memory / resource limits
+            last_err = exc
+            continue
+    raise RuntimeError(f"no viable Triton config for attention: {last_err}")

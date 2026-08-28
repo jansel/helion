@@ -1,0 +1,58 @@
+{
+  "accuracy": "PASS",
+  "benchmark_timer": "event",
+  "best_ms": 4715.576171875,
+  "best_tflops": 29.845236981797747,
+  "config": {
+    "budget_label": "1x",
+    "budget_seconds": 3374.6,
+    "elapsed_seconds": 3374.6637325286865,
+    "selection": {
+      "candidate_id": 32,
+      "hypothesis": "Row-owned softmax and output updates access X/O/Z at fixed columns across a warp. Strides 128 and 64 map all lanes to the same FP32 shared-memory bank. Padding row strides to 129 and 65 should eliminate severe bank conflicts with only ~1.5 KiB extra shared memory.",
+      "median_ms": 4774.5771484375,
+      "mutation_family": "smem-bank-padding",
+      "source_sha256": "b0e1db988031c6059ed19b4ad4b8cabc56453b9f35f8389aa0a916c70b4a44ac",
+      "tflops": 29.476429844972746
+    },
+    "source_sha256": "b0e1db988031c6059ed19b4ad4b8cabc56453b9f35f8389aa0a916c70b4a44ac"
+  },
+  "flop_model": "softmax_attention_forward",
+  "gpu": "NVIDIA B200",
+  "impl": "kernelagent-closed-1x",
+  "mean_ms": 4891.544216579861,
+  "median_ms": 4927.869140625,
+  "median_tflops": 28.559501954931847,
+  "mom_median_ms": 4927.869140625,
+  "mom_median_tflops": 28.559501954931847,
+  "notes": [
+    "KernelAgent Closed wall-clock tuning budget 3374.6s (1x); elapsed 3374.7s.",
+    "Selected source sha256 b0e1db988031c6059ed19b4ad4b8cabc56453b9f35f8389aa0a916c70b4a44ac; candidate 32; internal search time 4774.5771484375 ms.",
+    "GPT-5.6 had only a controlled CuTeDSL campaign MCP; no shell, web, arbitrary file, subagent, Helion, or FlashAttention access. Generated kernels ran in a network-isolated sandbox."
+  ],
+  "physical_gpu": "6",
+  "power_cap_w": 750,
+  "runs_ms": [
+    4715.576171875,
+    4924.7763671875,
+    4970.35791015625,
+    4908.87158203125,
+    4929.22998046875,
+    4928.66748046875,
+    4767.6845703125,
+    4950.86474609375,
+    4927.869140625
+  ],
+  "shape": {
+    "biased": 0,
+    "causal": 1,
+    "dtype": "float16",
+    "h": 32,
+    "head_dim": 64,
+    "seq_len": 131072,
+    "z": 2
+  },
+  "std_ms": 87.72040476972985,
+  "version": "KernelAgent v3-20260730; GPT-5.6; CuTe 4.5.1",
+  "version_label": "KernelAgent v3-20260730 / GPT-5.6 / CuTe 4.5.1"
+}

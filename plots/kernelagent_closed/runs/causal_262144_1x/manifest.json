@@ -1,0 +1,123 @@
+{
+  "agent_exit_codes": [
+    0,
+    0,
+    0,
+    -15
+  ],
+  "budget_label": "1x",
+  "budget_seconds": 5619.4,
+  "causal": true,
+  "completed_time_unix": 1786139610.1147056,
+  "cutlass_dsl_version": "4.5.1",
+  "elapsed_seconds": 5619.463653802872,
+  "final_measurement": {
+    "best_ms": 5373.90576171875,
+    "max_abs_error": 0.001953125,
+    "mean_abs_error": 0.0000028735864816553658,
+    "mean_ms": 5374.539605034723,
+    "median_ms": 5374.546875,
+    "runs_ms": [
+      5374.546875,
+      5374.458984375,
+      5374.607421875,
+      5374.8994140625,
+      5373.90576171875,
+      5374.4619140625,
+      5374.751953125,
+      5374.95361328125,
+      5374.2705078125
+    ],
+    "status": "PASS",
+    "std_ms": 0.323518796686853,
+    "stress_max_abs_error": 0.017578125,
+    "stress_mean_abs_error": 0.0006363122374750674,
+    "tflops": 104.74370519306561
+  },
+  "kernelagent_archive_sha256": "258853a7f19046f0cd3a3cc74564514f2756d24b54b1fbd7efa60f38d9a26e0b",
+  "kernelagent_binary_sha256": "2859181c5786a782d8946032967a5ee70a9bf191e272137c97703a12550330c0",
+  "kernelagent_family": "closed_binary",
+  "kernelagent_version": "v3-20260730",
+  "model": "gpt-5.6-sol",
+  "model_endpoint_name": "gpt-5.6-sol-ptu",
+  "physical_gpu": 6,
+  "posthoc_correctness_validation": {
+    "atol": 0.05,
+    "evaluator_sha256": "56312665b3754b53e4a9e962b7c8c33ed2f87cddbf93519ace06df8c545cf23b",
+    "max_abs_error": 0.001953125,
+    "mean_abs_error": 0.000002873586431750841,
+    "rtol": 0.02,
+    "source_sha256": "20e4d29a206326cdb7bc1e99914d7dcf2c7400c2dfff5bf8d9a1797b98f77ee6",
+    "standard_seed": 2026080106,
+    "status": "PASS",
+    "stress_max_abs_error": 0.017578125,
+    "stress_mean_abs_error": 0.0006363122340984906,
+    "stress_seed": 2026080107
+  },
+  "power_cap_w": 750,
+  "provider_reported_cost_usd": null,
+  "python_version": "3.12.13",
+  "reference_root_sha256": {
+    "cutedsl-kernel-expert/SKILL.md": "0ec45c9c0fed3084a14a4535d916630f318d6b13587bb35694e171dd02141afd",
+    "cutedsl-kernel-expert/references/kda-b200/BENCHMARK_GB200.md": "af8f0268463871994c84900cf20393982349aa80d16a9525197677b6ce0986c1",
+    "cutedsl-kernel-expert/references/kda-b200/LICENSE": "49576de0e0b7c988b93efeeb545d390fdd470adb6c4b3bca3c564ac4626a803e",
+    "cutedsl-kernel-expert/references/kda-b200/README.md": "c07cb45c251b76a0cf0787370f8534235efb81ddc5bef655ba7fc9d52f7ecd41",
+    "cutedsl-kernel-expert/references/kda-b200/flash_kda.py.txt": "8c7f2bded49aafc60cb4c0aee2174d0ca8cb3f533fa61134a0edfe99c8c77b2b",
+    "cutedsl-kernel-expert/references/kda-b200/flash_kda_cuda.cu": "27872d31e097388769b2aec543303e95a6cd85886fd079369e705f12782b68c2",
+    "cutedsl-kernel-expert/references/kda-b200/setup.py.txt": "753e73e665be232752a6e9adc9681c62abe776deea76f714daba1d7dfd77200c",
+    "cutedsl-kernel-expert/references/kda-b200/torch_ref.py.txt": "2b5872593a2ab851af5e55df02cf6c0a4b06a71ab60fd4f1272ad570c29d93db",
+    "cutedsl-kernel-expert/references/ptx_isa_9.2.agent.md": "6cb9a6aa7a49cf24a58b7052b0094ee0942522ddb9330e6745f36898c500ee5e",
+    "cutlass-4.5.1/blackwell/tutorial_gemm/fp16_gemm_0.py.txt": "d0e0fef3d11cb71d56201c63466bda2eed39780cf2379907ac978a0d9c078814",
+    "cutlass-4.5.1/blackwell/tutorial_gemm/fp16_gemm_1.py.txt": "b7fe5a75e90585212b292fd1f053938d5a45d1cb8bf647d6cfd847fa1730a8bb"
+  },
+  "seed": 2026080106,
+  "selection": {
+    "candidate_id": 71,
+    "hypothesis": "The score/value stride has a sharp optimum near 268: SN=264 was slower and SN=272 regressed severely. Test the remaining midpoint SN=266 with the confirmed SK=72, SO=68 configuration.",
+    "median_ms": 5374.95556640625,
+    "mutation_family": "smem-score-padding-isolation",
+    "source_sha256": "20e4d29a206326cdb7bc1e99914d7dcf2c7400c2dfff5bf8d9a1797b98f77ee6",
+    "tflops": 104.73574087566013
+  },
+  "seq_len": 262144,
+  "start_time_unix": 1786133528.0857155,
+  "submission_count": 72,
+  "thinking_effort": "xhigh",
+  "token_usage": {
+    "input_cache_creation_tokens": 0,
+    "input_cache_read_tokens": 18316800,
+    "input_other_tokens": 523765,
+    "model_calls": 105,
+    "output_tokens": 179921,
+    "total_tokens": 19020486
+  },
+  "tool_policy": {
+    "agent_builtin_tools": [],
+    "candidate_backend": "CuTeDSL only",
+    "candidate_network": "disabled by Linux network namespace",
+    "mcp_tools": [
+      "campaign_status",
+      "list_references",
+      "read_reference",
+      "search_references",
+      "submit_candidate",
+      "get_best_source",
+      "profile_best"
+    ]
+  },
+  "torch_version": "2.13.0.dev20260506+cu130",
+  "triton_version": "3.7.0+git88b227e2",
+  "verified_submission_count": 16,
+  "shape": {
+    "z": 2,
+    "h": 32,
+    "seq_len": 262144,
+    "head_dim": 64,
+    "dtype": "float16",
+    "causal": 1,
+    "biased": 0
+  },
+  "kernelagent_display_version": "v3-20260730",
+  "model_display_name": "GPT-5.6",
+  "source_sha256": "20e4d29a206326cdb7bc1e99914d7dcf2c7400c2dfff5bf8d9a1797b98f77ee6"
+}

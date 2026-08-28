@@ -1,0 +1,262 @@
+from __future__ import annotations
+
+import argparse
+import hashlib
+import importlib.machinery
+import importlib.util
+import json
+from pathlib import Path
+import statistics
+import sys
+import time
+import traceback
+from typing import Any
+from typing import Callable
+
+import torch
+
+SEED = 2026080106
+ATOL = 5e-2
+RTOL = 2e-2
+_CHECK_CHUNK_ROWS = 4096
+
+
+def _load_kernel(source: Path) -> Callable[..., torch.Tensor]:
+    source_hash = hashlib.sha256(source.read_bytes()).hexdigest()
+    module_name = f"_kernelagent_closed_{source_hash[:16]}"
+    loader = importlib.machinery.SourceFileLoader(module_name, str(source))
+    spec = importlib.util.spec_from_loader(module_name, loader)
+    if spec is None or spec.loader is None:
+        raise RuntimeError(f"could not load candidate {source}")
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[module_name] = module
+    spec.loader.exec_module(module)
+    function = getattr(module, "kernel_function", None)
+    if not callable(function):
+        raise TypeError("candidate must define callable kernel_function(q, k, v)")
+    return function
+
+
+def _make_inputs(
+    seq_len: int, *, stress: bool = False
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    generator = torch.Generator(device="cuda")
+    generator.manual_seed(SEED + int(stress))
+    shape = (2, 32, seq_len, 64)
+    q, k, v = tuple(
+        torch.randn(
+            shape,
+            device="cuda",
+            dtype=torch.float16,
+            generator=generator,
+        )
+        for _ in range(3)
+    )  # type: ignore[return-value]
+    if stress:
+        # Long dense attention over zero-mean inputs can be close enough to zero
+        # to satisfy an absolute tolerance. Sharper logits plus a random
+        # head/feature value offset rule out that degenerate approximation.
+        q.mul_(2.0)
+        k.mul_(2.0)
+        value_offset = torch.randn(
+            (2, 32, 1, 64),
+            device="cuda",
+            dtype=torch.float16,
+            generator=generator,
+        )
+        v.add_(value_offset)
+    return q, k, v
+
+
+def _check_output(actual: torch.Tensor, expected: torch.Tensor) -> dict[str, float]:
+    if not isinstance(actual, torch.Tensor):
+        raise TypeError("kernel_function must return a torch.Tensor")
+    if actual.shape != expected.shape:
+        raise AssertionError(
+            f"output shape {tuple(actual.shape)} != {tuple(expected.shape)}"
+        )
+    if actual.dtype is not torch.float16:
+        raise AssertionError(f"output dtype {actual.dtype} != torch.float16")
+    if actual.device.type != "cuda":
+        raise AssertionError(f"output device {actual.device} is not CUDA")
+    max_abs_accumulator = torch.zeros((), device=actual.device, dtype=torch.float32)
+    sum_abs_accumulator = torch.zeros((), device=actual.device, dtype=torch.float64)
+    mismatch_accumulator = torch.zeros((), device=actual.device, dtype=torch.int64)
+    for start in range(0, actual.shape[-2], _CHECK_CHUNK_ROWS):
+        stop = min(start + _CHECK_CHUNK_ROWS, actual.shape[-2])
+        actual_float = actual[..., start:stop, :].float()
+        expected_float = expected[..., start:stop, :].float()
+        difference = (actual_float - expected_float).abs()
+        finite_difference = torch.nan_to_num(
+            difference,
+            nan=float("inf"),
+            posinf=float("inf"),
+            neginf=float("inf"),
+        )
+        max_abs_accumulator = torch.maximum(
+            max_abs_accumulator, finite_difference.max()
+        )
+        sum_abs_accumulator += finite_difference.sum(dtype=torch.float64)
+        mismatch_accumulator += torch.count_nonzero(
+            ~torch.isclose(
+                actual_float,
+                expected_float,
+                atol=ATOL,
+                rtol=RTOL,
+            )
+        )
+
+    max_abs = float(max_abs_accumulator.item())
+    mean_abs = float(sum_abs_accumulator.item() / actual.numel())
+    mismatches = int(mismatch_accumulator.item())
+    if mismatches:
+        raise AssertionError(
+            "Tensor-likes are not close!\n\n"
+            f"Mismatched elements: {mismatches} / {actual.numel()}\n"
+            f"Greatest absolute difference: {max_abs} "
+            f"(atol={ATOL}, rtol={RTOL})"
+        )
+    return {"max_abs_error": max_abs, "mean_abs_error": mean_abs}
+
+
+def _thermal_warmup(duration_ms: int) -> None:
+    if duration_ms <= 0:
+        return
+    matrix = torch.randn(4096, 4096, device="cuda", dtype=torch.bfloat16)
+    torch.cuda.synchronize()
+    deadline = time.monotonic() + duration_ms / 1000.0
+    while time.monotonic() < deadline:
+        for _ in range(50):
+            matrix = matrix @ matrix
+        torch.cuda.synchronize()
+
+
+def _benchmark(
+    function: Callable[[], torch.Tensor],
+    *,
+    num_runs: int,
+    warmup_ms: int,
+    rep_ms: int,
+    cache_warmup_calls: int,
+    thermal_warmup_ms: int,
+) -> dict[str, Any]:
+    from triton.testing import do_bench
+
+    for _ in range(cache_warmup_calls):
+        function()
+    torch.cuda.synchronize()
+    _thermal_warmup(thermal_warmup_ms)
+    runs = [
+        float(do_bench(function, warmup=warmup_ms, rep=rep_ms)) for _ in range(num_runs)
+    ]
+    return {
+        "best_ms": min(runs),
+        "median_ms": statistics.median(runs),
+        "mean_ms": statistics.mean(runs),
+        "std_ms": statistics.stdev(runs) if len(runs) > 1 else 0.0,
+        "runs_ms": runs,
+    }
+
+
+def _attention_flops(seq_len: int, causal: bool) -> float:
+    flops = 4.0 * 2 * 32 * seq_len * seq_len * 64
+    return flops / 2.0 if causal else flops
+
+
+def evaluate(args: argparse.Namespace) -> dict[str, Any]:
+    function = _load_kernel(args.source.resolve())
+    q, k, v = _make_inputs(args.seq_len)
+
+    def invoke() -> torch.Tensor:
+        return function(q, k, v)
+
+    if args.mode == "invoke":
+        output = invoke()
+        if not isinstance(output, torch.Tensor):
+            raise TypeError("kernel_function must return a torch.Tensor")
+        torch.cuda.synchronize()
+        return {"status": "PASS"}
+
+    with torch.nn.attention.sdpa_kernel(
+        [torch.nn.attention.SDPBackend.CUDNN_ATTENTION]
+    ):
+        expected = torch.nn.functional.scaled_dot_product_attention(
+            q, k, v, is_causal=bool(args.causal)
+        )
+    errors = _check_output(invoke(), expected)
+
+    stress_q, stress_k, stress_v = _make_inputs(args.seq_len, stress=True)
+    with torch.nn.attention.sdpa_kernel(
+        [torch.nn.attention.SDPBackend.CUDNN_ATTENTION]
+    ):
+        stress_expected = torch.nn.functional.scaled_dot_product_attention(
+            stress_q, stress_k, stress_v, is_causal=bool(args.causal)
+        )
+    stress_errors = {
+        f"stress_{key}": value
+        for key, value in _check_output(
+            function(stress_q, stress_k, stress_v), stress_expected
+        ).items()
+    }
+
+    if args.mode == "validate":
+        return {"status": "PASS", **errors, **stress_errors}
+
+    if args.mode == "search":
+        stats = _benchmark(
+            invoke,
+            num_runs=1,
+            warmup_ms=200,
+            rep_ms=200,
+            cache_warmup_calls=2,
+            thermal_warmup_ms=1000,
+        )
+    else:
+        stats = _benchmark(
+            invoke,
+            num_runs=9,
+            warmup_ms=1000,
+            rep_ms=500,
+            cache_warmup_calls=5,
+            thermal_warmup_ms=10000,
+        )
+    median_ms = float(stats["median_ms"])
+    stats.update(
+        {
+            "status": "PASS",
+            "tflops": _attention_flops(args.seq_len, bool(args.causal))
+            / (median_ms * 1e9),
+            **errors,
+            **stress_errors,
+        }
+    )
+    return stats
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--source", type=Path, required=True)
+    parser.add_argument("--seq-len", type=int, required=True)
+    parser.add_argument("--causal", type=int, choices=(0, 1), required=True)
+    parser.add_argument(
+        "--mode", choices=("search", "final", "invoke", "validate"), required=True
+    )
+    return parser.parse_args()
+
+
+def main() -> None:
+    args = parse_args()
+    try:
+        payload = evaluate(args)
+    except Exception as error:
+        payload = {
+            "status": "FAIL",
+            "error_type": type(error).__name__,
+            "error": str(error),
+            "traceback": traceback.format_exc()[-8000:],
+        }
+    print("KERNELAGENT_RESULT=" + json.dumps(payload, sort_keys=True))
+
+
+if __name__ == "__main__":
+    main()

@@ -1,0 +1,131 @@
+{
+ "input_seed": 2026080106,
+ "autotune_seed_rule": "dense: 2026092100 + seq_len//1024; causal: 2026093100 + seq_len//1024",
+ "dense_physical_gpu": 7,
+ "causal_physical_gpu": 6,
+ "power_cap_w": 750,
+ "benchmark_timer": "event",
+ "measure_cooldown_temp_c": 55.0,
+ "files": {
+  "0_131072_helion-cute.json": {
+   "bytes": 6131641,
+   "gz_bytes": 786040,
+   "sha256": "bbe51a356f401ec5045653a7036934e49855c19db194040641e732736680ef80"
+  },
+  "0_131072_helion-cute.strict-prevalidation.json": {
+   "bytes": 6127251,
+   "gz_bytes": 784470,
+   "sha256": "e7f3b9773fa9b2290b3ae02a66e9d17085268b0e937398b3c231528c005bc3e8"
+  },
+  "0_131072_sdpa.json": {
+   "bytes": 1100,
+   "gz_bytes": 633,
+   "sha256": "89771dcd1fef9fac49cb119b37ca38cd3683a3082336174fc6a4554ed306774a"
+  },
+  "0_262144_helion-cute.json": {
+   "bytes": 6163620,
+   "gz_bytes": 768520,
+   "sha256": "82a20984fade8c9ffbd402c5304e17b2f31d4f8691b67b682e3e1b3711743f5e"
+  },
+  "0_262144_helion-cute.strict-prevalidation.json": {
+   "bytes": 6159244,
+   "gz_bytes": 767229,
+   "sha256": "d3f74da125ad7746799964267e6e2cc635917f1f68a044e4251f0933df1fe183"
+  },
+  "0_262144_sdpa.json": {
+   "bytes": 1102,
+   "gz_bytes": 636,
+   "sha256": "45a1dc042bc3204500a3ea63d0da356addb4231a89abc2b60bfcd457518d656c"
+  },
+  "0_32768_helion-cute.json": {
+   "bytes": 6209601,
+   "gz_bytes": 825238,
+   "sha256": "b1101dda3ed73485f696ecbe567b9845b4e87f16f5da0fe5d950be2359930026"
+  },
+  "0_32768_helion-cute.strict-prevalidation.json": {
+   "bytes": 6205214,
+   "gz_bytes": 823910,
+   "sha256": "ef60c807924bab0a750bbd52efade8e4ad194b14e81d97452c534db285208e85"
+  },
+  "0_32768_sdpa.json": {
+   "bytes": 1091,
+   "gz_bytes": 630,
+   "sha256": "cc8cbc9f1c5607d2451b1604aebadbbd5e6e56c500abafdb5f73a9ed210131ba"
+  },
+  "0_65536_helion-cute.json": {
+   "bytes": 6173229,
+   "gz_bytes": 807979,
+   "sha256": "512279f447a4e2a722eb2e75f4feab991fc07e278e93eb0241d8b3b65316cb52"
+  },
+  "0_65536_helion-cute.strict-prevalidation.json": {
+   "bytes": 6168853,
+   "gz_bytes": 806471,
+   "sha256": "fdbe1f078c37644123958b321c6344b9d027f6e88065abde02d2bde4ba665632"
+  },
+  "0_65536_sdpa.json": {
+   "bytes": 1090,
+   "gz_bytes": 635,
+   "sha256": "f6c0c81263e1991a8e6489bc45cc9aeb022df932b50f3916978f3a2e209ccbb0"
+  },
+  "1_131072_helion-cute.json": {
+   "bytes": 1535244,
+   "gz_bytes": 125308,
+   "sha256": "0d448ce7cb5f8112be97257382d8c1bfc88d82a9f5abeb289ef6b8c26cf5b673"
+  },
+  "1_131072_helion-cute.strict-prevalidation.json": {
+   "bytes": 1530874,
+   "gz_bytes": 123761,
+   "sha256": "9c841d9ecf3e987f5ab9869dd68b4ed2043e7e42ed62b12d4bb34ab243aa1fa2"
+  },
+  "1_131072_sdpa.json": {
+   "bytes": 1096,
+   "gz_bytes": 635,
+   "sha256": "05dc4af73fb920735ee7c5278fd61221903f94de97f4e30b36942db3f65ac4b9"
+  },
+  "1_262144_helion-cute.json": {
+   "bytes": 1580712,
+   "gz_bytes": 125184,
+   "sha256": "28d8e51d66595d46f482c13f8e5aad40573aec0f874fcc5e82b3eba5c4799e3d"
+  },
+  "1_262144_helion-cute.strict-prevalidation.json": {
+   "bytes": 1576337,
+   "gz_bytes": 123675,
+   "sha256": "9e0703fd73cb55ec29fd01dc2d4444c6a8fc5f8c316c4b58ebae9603a6398b4d"
+  },
+  "1_262144_sdpa.json": {
+   "bytes": 1079,
+   "gz_bytes": 617,
+   "sha256": "f9ee60b3ca262d9afb61e2a06a662254f286a62483a73af8adb683c3277aad58"
+  },
+  "1_524288_helion-cute.json": {
+   "bytes": 1472760,
+   "gz_bytes": 113531,
+   "sha256": "603035281c693434c2a19f75624ac9c71060eae8bef85f5ce5a6a134e6b1c4f5"
+  },
+  "1_524288_helion-cute.strict-prevalidation.json": {
+   "bytes": 1468399,
+   "gz_bytes": 112074,
+   "sha256": "20e148d3de74881de399784344b4225c60311d3d983419ecbc146339712d7fec"
+  },
+  "1_524288_sdpa.json": {
+   "bytes": 1073,
+   "gz_bytes": 622,
+   "sha256": "db153b3cfbad10f02c06060f5b53ec9a72cfc442ac7cec07824403c928e19346"
+  },
+  "1_65536_helion-cute.json": {
+   "bytes": 1556883,
+   "gz_bytes": 128899,
+   "sha256": "c0a6ba1a65941e1978052d70344c89d3f3de2742c0ce419bc1ca40ff2f1e9533"
+  },
+  "1_65536_helion-cute.strict-prevalidation.json": {
+   "bytes": 1552519,
+   "gz_bytes": 127520,
+   "sha256": "d5f946aaf6ff5ff02fdbb3c51660bb7a977282c630a8c0647b6379eed71cb63b"
+  },
+  "1_65536_sdpa.json": {
+   "bytes": 1087,
+   "gz_bytes": 632,
+   "sha256": "8139a45fb9c32884dd88734b3144a1ab5029edbd6ac7f29e9c74d583ce0c4ae5"
+  }
+ }
+}

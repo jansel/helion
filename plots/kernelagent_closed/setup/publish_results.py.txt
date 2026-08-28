@@ -1,0 +1,379 @@
+from __future__ import annotations
+
+import argparse
+import csv
+import json
+from pathlib import Path
+import shutil
+from typing import Any
+
+VERSION = "v3-20260730"
+BUDGET_LABELS = ("1x", "2x")
+SHAPES = (
+    ("dense", 32768),
+    ("dense", 65536),
+    ("dense", 131072),
+    ("dense", 262144),
+    ("causal", 65536),
+    ("causal", 131072),
+    ("causal", 262144),
+    ("causal", 524288),
+)
+USAGE_FIELDS = (
+    "model_calls",
+    "input_other_tokens",
+    "input_cache_creation_tokens",
+    "input_cache_read_tokens",
+    "output_tokens",
+    "total_tokens",
+)
+WIRE_USAGE_FIELDS = {
+    "input_other": "input_other_tokens",
+    "input_cache_creation": "input_cache_creation_tokens",
+    "input_cache_read": "input_cache_read_tokens",
+    "output": "output_tokens",
+}
+PUBLIC_LIST_CONTEXT_THRESHOLD_TOKENS = 272_000
+PUBLIC_LIST_RATES_PER_MILLION = {
+    "short": {
+        "input_other": 5.0,
+        "input_cache_creation": 6.25,
+        "input_cache_read": 0.5,
+        "output": 30.0,
+    },
+    "long": {
+        "input_other": 10.0,
+        "input_cache_creation": 12.5,
+        "input_cache_read": 1.0,
+        "output": 60.0,
+    },
+}
+
+
+def _load(path: Path) -> dict[str, Any]:
+    return json.loads(path.read_text())
+
+
+def _write(path: Path, payload: object) -> None:
+    temporary = path.with_suffix(path.suffix + ".tmp")
+    temporary.write_text(json.dumps(payload) + "\n")
+    temporary.replace(path)
+
+
+def _label_public_kernelagent(result: dict[str, Any]) -> None:
+    if result.get("impl") not in {
+        "kernelagent-1x",
+        "kernelagent-2x",
+        "kernelagent-10x",
+    }:
+        return
+    for field in ("version", "version_label"):
+        value = result.get(field)
+        if (
+            isinstance(value, str)
+            and value.startswith("KernelAgent ")
+            and not value.startswith("KernelAgent Public ")
+        ):
+            result[field] = value.replace("KernelAgent ", "KernelAgent Public ", 1)
+
+
+def _validate_run(
+    run_dir: Path, variant: str, seq_len: int, budget_label: str
+) -> dict[str, Any]:
+    required = (
+        run_dir / "manifest.json",
+        run_dir / "benchmark_result.json",
+    )
+    missing = [str(path) for path in required if not path.is_file()]
+    if missing:
+        raise RuntimeError(f"incomplete run {run_dir}: missing {missing}")
+    manifest = _load(required[0])
+    expected = {
+        "kernelagent_family": "closed_binary",
+        "kernelagent_version": VERSION,
+        "seq_len": seq_len,
+        "causal": variant == "causal",
+        "budget_label": budget_label,
+        "model": "gpt-5.6-sol",
+        "power_cap_w": 750,
+    }
+    mismatches = {
+        key: (manifest.get(key), value)
+        for key, value in expected.items()
+        if manifest.get(key) != value
+    }
+    if mismatches:
+        raise RuntimeError(f"manifest mismatch in {run_dir}: {mismatches}")
+    result = _load(run_dir / "benchmark_result.json")
+    if result.get("accuracy") == "PASS":
+        if not (run_dir / "selected_kernel.py.txt").is_file():
+            raise RuntimeError(f"passing run has no selected source in {run_dir}")
+        validation = manifest.get("posthoc_correctness_validation", {})
+        if (
+            validation.get("status") != "PASS"
+            or "stress_max_abs_error" not in validation
+        ):
+            raise RuntimeError(f"missing dual-case post-hoc validation in {run_dir}")
+    elif result.get("accuracy") != "FAIL" or not manifest.get("failure_reason"):
+        raise RuntimeError(f"invalid failed benchmark result in {run_dir}")
+    return manifest
+
+
+def _public_list_cost_estimate(
+    run_dir: Path, expected_usage: dict[str, Any]
+) -> dict[str, int | float]:
+    messages: dict[str, dict[str, Any]] = {}
+    for path in sorted((run_dir / "kernelagent-history").rglob("wire.jsonl")):
+        for line in path.read_text(errors="replace").splitlines():
+            try:
+                record = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            message = record.get("message", {})
+            payload = message.get("payload", {})
+            usage = payload.get("token_usage")
+            message_id = payload.get("message_id")
+            if (
+                message.get("type") == "StatusUpdate"
+                and isinstance(usage, dict)
+                and message_id
+            ):
+                messages[str(message_id)] = payload
+
+    observed_usage = dict.fromkeys(USAGE_FIELDS, 0)
+    observed_usage["model_calls"] = len(messages)
+    short_calls = 0
+    long_calls = 0
+    cost = 0.0
+    for payload in messages.values():
+        tier = (
+            "long"
+            if int(payload.get("context_tokens", 0))
+            > PUBLIC_LIST_CONTEXT_THRESHOLD_TOKENS
+            else "short"
+        )
+        if tier == "long":
+            long_calls += 1
+        else:
+            short_calls += 1
+        usage = payload["token_usage"]
+        for wire_field, csv_field in WIRE_USAGE_FIELDS.items():
+            tokens = int(usage.get(wire_field, 0))
+            observed_usage[csv_field] += tokens
+            cost += tokens * PUBLIC_LIST_RATES_PER_MILLION[tier][wire_field] / 1e6
+    observed_usage["total_tokens"] = sum(
+        observed_usage[field] for field in WIRE_USAGE_FIELDS.values()
+    )
+    expected = {field: int(expected_usage[field]) for field in USAGE_FIELDS}
+    if observed_usage != expected:
+        raise RuntimeError(
+            f"wire token accounting mismatch in {run_dir}: "
+            f"observed={observed_usage}, expected={expected}"
+        )
+    return {
+        "short_context_model_calls": short_calls,
+        "long_context_model_calls": long_calls,
+        "estimated_public_list_cost_usd": round(cost, 6),
+    }
+
+
+def _usage_rows(
+    manifests: dict[tuple[str, str, int], dict[str, Any]],
+    source_root: Path,
+) -> list[dict[str, object]]:
+    rows: list[dict[str, object]] = []
+    caveat = (
+        "wire StatusUpdate records; a deadline-killed in-flight model call may be "
+        "absent; public-list estimate uses OpenAI Standard per-call short/long "
+        "context pricing at a 272K-token boundary; the GPT-5.6 endpoint and closed "
+        "binary reported no actual dollar cost"
+    )
+    all_totals = dict.fromkeys(USAGE_FIELDS, 0)
+    all_helion = 0.0
+    all_allocated = 0.0
+    all_actual = 0.0
+    for budget_label in BUDGET_LABELS:
+        multiplier = int(budget_label.removesuffix("x"))
+        totals = dict.fromkeys(USAGE_FIELDS, 0)
+        total_helion = 0.0
+        total_allocated = 0.0
+        total_actual = 0.0
+        total_short_calls = 0
+        total_long_calls = 0
+        total_estimated_cost = 0.0
+        for variant, seq_len in SHAPES:
+            manifest = manifests[(budget_label, variant, seq_len)]
+            usage = manifest["token_usage"]
+            estimate = _public_list_cost_estimate(
+                source_root / f"{variant}_{seq_len}_{budget_label}", usage
+            )
+            budget = float(manifest["budget_seconds"])
+            actual = float(manifest["elapsed_seconds"])
+            helion_budget = budget / multiplier
+            row: dict[str, object] = {
+                "row_type": "run",
+                "run": f"{variant}_{seq_len}_{budget_label}",
+                "implementation": "KernelAgent Closed Binary",
+                "version": VERSION,
+                "model": "GPT-5.6",
+                "variant": variant,
+                "seq_len": seq_len,
+                "time_multiplier": budget_label,
+                "helion_tuning_time_seconds": helion_budget,
+                "allocated_tuning_time_seconds": budget,
+                "actual_tuning_time_seconds": actual,
+                "reported_cost_usd": "",
+                **estimate,
+                "accounting_caveat": caveat,
+            }
+            for field in USAGE_FIELDS:
+                value = int(usage[field])
+                row[field] = value
+                totals[field] += value
+                all_totals[field] += value
+            rows.append(row)
+            total_helion += helion_budget
+            total_allocated += budget
+            total_actual += actual
+            total_short_calls += int(estimate["short_context_model_calls"])
+            total_long_calls += int(estimate["long_context_model_calls"])
+            total_estimated_cost += float(
+                estimate["estimated_public_list_cost_usd"]
+            )
+        rows.append(
+            {
+                "row_type": "summary",
+                "run": f"closed_binary_{budget_label}_total",
+                "implementation": "KernelAgent Closed Binary",
+                "version": VERSION,
+                "model": "GPT-5.6",
+                "variant": "all",
+                "seq_len": "",
+                "time_multiplier": budget_label,
+                "helion_tuning_time_seconds": total_helion,
+                "allocated_tuning_time_seconds": total_allocated,
+                "actual_tuning_time_seconds": total_actual,
+                **totals,
+                "reported_cost_usd": "",
+                "short_context_model_calls": total_short_calls,
+                "long_context_model_calls": total_long_calls,
+                "estimated_public_list_cost_usd": round(total_estimated_cost, 6),
+                "accounting_caveat": caveat,
+            }
+        )
+        all_helion += total_helion
+        all_allocated += total_allocated
+        all_actual += total_actual
+    all_estimated_cost = sum(
+        float(row["estimated_public_list_cost_usd"])
+        for row in rows
+        if row["row_type"] == "summary" and row["time_multiplier"] != "all"
+    )
+    all_short_calls = sum(
+        int(row["short_context_model_calls"])
+        for row in rows
+        if row["row_type"] == "summary" and row["time_multiplier"] != "all"
+    )
+    all_long_calls = sum(
+        int(row["long_context_model_calls"])
+        for row in rows
+        if row["row_type"] == "summary" and row["time_multiplier"] != "all"
+    )
+    rows.append(
+        {
+            "row_type": "summary",
+            "run": "closed_binary_all_total",
+            "implementation": "KernelAgent Closed Binary",
+            "version": VERSION,
+            "model": "GPT-5.6",
+            "variant": "all",
+            "seq_len": "",
+            "time_multiplier": "all",
+            "helion_tuning_time_seconds": all_helion,
+            "allocated_tuning_time_seconds": all_allocated,
+            "actual_tuning_time_seconds": all_actual,
+            **all_totals,
+            "reported_cost_usd": "",
+            "short_context_model_calls": all_short_calls,
+            "long_context_model_calls": all_long_calls,
+            "estimated_public_list_cost_usd": round(all_estimated_cost, 6),
+            "accounting_caveat": caveat,
+        }
+    )
+    return rows
+
+
+def publish(args: argparse.Namespace) -> None:
+    source_root = args.run_root.resolve()
+    output_root = args.output_root.resolve()
+    payload_root = args.payload_root.resolve()
+    manifests = {
+        (budget_label, variant, seq_len): _validate_run(
+            source_root / f"{variant}_{seq_len}_{budget_label}",
+            variant,
+            seq_len,
+            budget_label,
+        )
+        for budget_label in BUDGET_LABELS
+        for variant, seq_len in SHAPES
+    }
+
+    runs_root = output_root / "runs"
+    results_root = output_root / "results"
+    runs_root.mkdir(parents=True, exist_ok=True)
+    results_root.mkdir(parents=True, exist_ok=True)
+
+    public_results_root = output_root.parent / "kernelagent" / "results"
+    for result_path in public_results_root.glob("*_kernelagent-*.json"):
+        result = _load(result_path)
+        _label_public_kernelagent(result)
+        _write(result_path, result)
+
+    for budget_label in BUDGET_LABELS:
+        impl = f"kernelagent-closed-{budget_label}"
+        for variant, seq_len in SHAPES:
+            source = source_root / f"{variant}_{seq_len}_{budget_label}"
+            destination = runs_root / source.name
+            destination.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(source / "manifest.json", destination / "manifest.json")
+            selected_source = source / "selected_kernel.py.txt"
+            selected_destination = destination / "selected_kernel.py.txt"
+            if selected_source.is_file():
+                shutil.copy2(selected_source, selected_destination)
+            elif selected_destination.exists():
+                selected_destination.unlink()
+            result_path = results_root / f"{variant}_{seq_len}_{impl}.json"
+            shutil.copy2(source / "benchmark_result.json", result_path)
+
+            payload_path = payload_root / f"{variant}_{seq_len}.json"
+            payload = _load(payload_path)
+            result = _load(result_path)
+            for existing_result in payload["results"]:
+                _label_public_kernelagent(existing_result)
+            payload["results"] = [
+                item for item in payload["results"] if item.get("impl") != impl
+            ]
+            payload["results"].append(result)
+            _write(payload_path, payload)
+
+    usage_path = output_root.parent / "kernelagent_closed_tuning_usage.csv"
+    rows = _usage_rows(manifests, source_root)
+    with usage_path.open("w", newline="") as handle:
+        writer = csv.DictWriter(handle, fieldnames=list(rows[0]))
+        writer.writeheader()
+        writer.writerows(rows)
+    print(f"Published {len(SHAPES) * len(BUDGET_LABELS)} runs to {output_root}")
+    print(f"Updated payloads in {payload_root}")
+    print(f"Wrote {usage_path}")
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--run-root", type=Path, required=True)
+    parser.add_argument("--output-root", type=Path, required=True)
+    parser.add_argument("--payload-root", type=Path, required=True)
+    return parser.parse_args()
+
+
+if __name__ == "__main__":
+    publish(parse_args())

@@ -1,0 +1,5 @@
+"""Smoke-test shim; the production environment must install python-dotenv."""
+
+
+def load_dotenv(*args, **kwargs):
+    return False

@@ -1,0 +1,251 @@
+from __future__ import annotations
+
+import torch
+import triton
+import triton.language as tl
+
+
+@triton.jit
+def _p_from_qk(qk, USE_ASM: tl.constexpr, P_CAP: tl.constexpr, DTYPE: tl.constexpr):
+    # packed fp16 path: 2 score elements per instruction for both the clamp and
+    # the exp2 (0x4B004B00 == half2(14.0, 14.0))
+    if USE_ASM:
+        p = tl.inline_asm_elementwise(
+            "{ .reg .b32 t; mov.b32 t, 0x4B004B00; min.f16x2 t, $1, t; ex2.approx.f16x2 $0, t; }",
+            "=r,r",
+            [qk.to(tl.float16)],
+            dtype=tl.float16,
+            is_pure=True,
+            pack=2,
+        )
+    else:
+        p = tl.math.exp2(tl.minimum(qk, P_CAP)).to(DTYPE)
+    return p
+
+
+@triton.jit
+def _attn_fwd_inner(acc, l_i, q,
+                    K_block_ptr, V_block_ptr,
+                    start_m, N_CTX,
+                    offs_m, offs_n,
+                    BLOCK_M: tl.constexpr,
+                    BLOCK_N: tl.constexpr,
+                    STAGE: tl.constexpr,
+                    EVEN_N: tl.constexpr,
+                    USE_ASM: tl.constexpr,
+                    P_CAP: tl.constexpr,
+                    DTYPE: tl.constexpr):
+    if STAGE == 1:
+        lo = 0
+        hi = start_m * BLOCK_M
+    elif STAGE == 2:
+        lo = start_m * BLOCK_M
+        hi = tl.minimum((start_m + 1) * BLOCK_M, N_CTX)
+        lo = tl.multiple_of(lo, BLOCK_M)
+    else:
+        lo = 0
+        hi = N_CTX
+
+    K_block_ptr = tl.advance(K_block_ptr, (0, lo))
+    V_block_ptr = tl.advance(V_block_ptr, (lo, 0))
+
+    for start_n in tl.range(lo, hi, BLOCK_N):
+        start_n = tl.multiple_of(start_n, BLOCK_N)
+
+        if EVEN_N:
+            k = tl.load(K_block_ptr)
+        else:
+            k = tl.load(K_block_ptr, boundary_check=(1,), padding_option="zero")
+
+        # Q is pre-scaled by sm_scale*log2(e) -> qk already lives in the exp2 domain
+        qk = tl.dot(q, k)
+
+        # fused clamp + exp2, packed 2-wide, straight into the P operand dtype:
+        # no fp32 exp2 on the SFU, no separate fp32 min, no extra cast.
+        p = _p_from_qk(qk, USE_ASM, P_CAP, DTYPE)
+
+        if STAGE == 2:
+            causal_mask = offs_m[:, None] >= (start_n + offs_n[None, :])
+            p = tl.where(causal_mask, p, 0.0).to(DTYPE)
+        elif not EVEN_N:
+            p = tl.where((start_n + offs_n)[None, :] < N_CTX, p, 0.0).to(DTYPE)
+
+        if EVEN_N:
+            v = tl.load(V_block_ptr)
+        else:
+            v = tl.load(V_block_ptr, boundary_check=(0,), padding_option="zero")
+
+        acc = tl.dot(p, v, acc)
+
+        # row-wise reduction instead of a full BLOCK_M x BLOCK_N fp32 accumulator
+        # tile: removes one fp32 add per score element and ~32 regs/thread.
+        l_i += tl.sum(p, 1).to(tl.float32)
+
+        K_block_ptr = tl.advance(K_block_ptr, (0, BLOCK_N))
+        V_block_ptr = tl.advance(V_block_ptr, (BLOCK_N, 0))
+
+    return acc, l_i
+
+
+@triton.jit
+def _attn_fwd(Q, K, V, Out,
+              sm_scale,
+              stride_qz, stride_qh, stride_qm, stride_qk,
+              stride_kz, stride_kh, stride_kn, stride_kk,
+              stride_vz, stride_vh, stride_vn, stride_vk,
+              stride_oz, stride_oh, stride_om, stride_ok,
+              H, N_CTX,
+              HEAD_DIM: tl.constexpr,
+              BLOCK_M: tl.constexpr,
+              BLOCK_N: tl.constexpr,
+              NUM_M_TILES: tl.constexpr,
+              EVEN_M: tl.constexpr,
+              EVEN_N: tl.constexpr,
+              CAUSAL: tl.constexpr,
+              USE_ASM: tl.constexpr,
+              P_CAP: tl.constexpr):
+    # longest-job-first: heaviest causal tiles are dispatched first
+    start_m = NUM_M_TILES - 1 - tl.program_id(0)
+    off_hz = tl.program_id(1)
+    off_z = (off_hz // H).to(tl.int64)
+    off_h = (off_hz % H).to(tl.int64)
+
+    q_off = off_z * stride_qz + off_h * stride_qh
+    k_off = off_z * stride_kz + off_h * stride_kh
+    v_off = off_z * stride_vz + off_h * stride_vh
+    o_off = off_z * stride_oz + off_h * stride_oh
+
+    Q_block_ptr = tl.make_block_ptr(
+        base=Q + q_off, shape=(N_CTX, HEAD_DIM), strides=(stride_qm, stride_qk),
+        offsets=(start_m * BLOCK_M, 0), block_shape=(BLOCK_M, HEAD_DIM), order=(1, 0))
+    K_block_ptr = tl.make_block_ptr(
+        base=K + k_off, shape=(HEAD_DIM, N_CTX), strides=(stride_kk, stride_kn),
+        offsets=(0, 0), block_shape=(HEAD_DIM, BLOCK_N), order=(0, 1))
+    V_block_ptr = tl.make_block_ptr(
+        base=V + v_off, shape=(N_CTX, HEAD_DIM), strides=(stride_vn, stride_vk),
+        offsets=(0, 0), block_shape=(BLOCK_N, HEAD_DIM), order=(1, 0))
+    O_block_ptr = tl.make_block_ptr(
+        base=Out + o_off, shape=(N_CTX, HEAD_DIM), strides=(stride_om, stride_ok),
+        offsets=(start_m * BLOCK_M, 0), block_shape=(BLOCK_M, HEAD_DIM), order=(1, 0))
+
+    offs_m = start_m * BLOCK_M + tl.arange(0, BLOCK_M)
+    offs_n = tl.arange(0, BLOCK_N)
+
+    acc = tl.zeros([BLOCK_M, HEAD_DIM], dtype=tl.float32)
+    l_i = tl.zeros([BLOCK_M], dtype=tl.float32)
+
+    qk_scale = sm_scale * 1.44269504088896  # fold log2(e) -> exp2
+
+    if EVEN_M:
+        q = tl.load(Q_block_ptr)
+    else:
+        q = tl.load(Q_block_ptr, boundary_check=(0,), padding_option="zero")
+    q = (q * qk_scale).to(Q.dtype.element_ty)
+
+    DTYPE: tl.constexpr = V.dtype.element_ty
+
+    if CAUSAL:
+        acc, l_i = _attn_fwd_inner(acc, l_i, q,
+                                   K_block_ptr, V_block_ptr,
+                                   start_m, N_CTX, offs_m, offs_n,
+                                   BLOCK_M, BLOCK_N, 1, True,
+                                   USE_ASM, P_CAP, DTYPE)
+        acc, l_i = _attn_fwd_inner(acc, l_i, q,
+                                   K_block_ptr, V_block_ptr,
+                                   start_m, N_CTX, offs_m, offs_n,
+                                   BLOCK_M, BLOCK_N, 2, EVEN_N,
+                                   USE_ASM, P_CAP, DTYPE)
+    else:
+        acc, l_i = _attn_fwd_inner(acc, l_i, q,
+                                   K_block_ptr, V_block_ptr,
+                                   start_m, N_CTX, offs_m, offs_n,
+                                   BLOCK_M, BLOCK_N, 3, EVEN_N,
+                                   USE_ASM, P_CAP, DTYPE)
+
+    l_i = tl.where(l_i == 0.0, 1.0, l_i)
+    acc = acc / l_i[:, None]
+
+    if EVEN_M:
+        tl.store(O_block_ptr, acc.to(Out.dtype.element_ty))
+    else:
+        tl.store(O_block_ptr, acc.to(Out.dtype.element_ty), boundary_check=(0,))
+
+
+_ASM_EXP2_OK = True
+
+
+def _pick_config(head_dim: int):
+    if head_dim <= 64:
+        return 128, 64, 8, 3
+    if head_dim <= 128:
+        return 128, 64, 8, 2
+    return 64, 32, 4, 2
+
+
+def kernel_function(q: torch.Tensor,
+                    k: torch.Tensor,
+                    v: torch.Tensor,
+                    is_causal: bool = True,
+                    sm_scale: float | None = None) -> torch.Tensor:
+    global _ASM_EXP2_OK
+
+    if not (q.is_cuda and k.is_cuda and v.is_cuda):
+        raise ValueError("q, k, v must be CUDA tensors")
+    if q.dim() != 4 or k.dim() != 4 or v.dim() != 4:
+        raise ValueError("q, k, v must be 4-D [B, H, N, D] tensors")
+    if q.shape != k.shape or q.shape != v.shape:
+        raise ValueError("q, k, v must all have the same shape")
+    if q.dtype != k.dtype or q.dtype != v.dtype:
+        raise ValueError("q, k, v must share a dtype")
+
+    B, H, N_CTX, HEAD_DIM = q.shape
+    if HEAD_DIM not in (16, 32, 64, 128, 256):
+        raise ValueError(f"unsupported head dim {HEAD_DIM}")
+
+    if sm_scale is None:
+        sm_scale = 1.0 / (HEAD_DIM ** 0.5)
+
+    out = torch.empty_like(q)
+
+    BLOCK_M, BLOCK_N, num_warps, num_stages = _pick_config(HEAD_DIM)
+    while BLOCK_M % BLOCK_N != 0:
+        BLOCK_N //= 2
+
+    p_cap = 14.0 if q.dtype == torch.float16 else 60.0
+
+    num_m_tiles = triton.cdiv(N_CTX, BLOCK_M)
+    grid = (num_m_tiles, B * H, 1)
+
+    def _launch(use_asm: bool):
+        _attn_fwd[grid](
+            q, k, v, out,
+            sm_scale,
+            q.stride(0), q.stride(1), q.stride(2), q.stride(3),
+            k.stride(0), k.stride(1), k.stride(2), k.stride(3),
+            v.stride(0), v.stride(1), v.stride(2), v.stride(3),
+            out.stride(0), out.stride(1), out.stride(2), out.stride(3),
+            H, N_CTX,
+            HEAD_DIM=HEAD_DIM,
+            BLOCK_M=BLOCK_M,
+            BLOCK_N=BLOCK_N,
+            NUM_M_TILES=num_m_tiles,
+            EVEN_M=(N_CTX % BLOCK_M) == 0,
+            EVEN_N=(N_CTX % BLOCK_N) == 0,
+            CAUSAL=bool(is_causal),
+            USE_ASM=use_asm,
+            P_CAP=p_cap,
+            num_warps=num_warps,
+            num_stages=num_stages,
+        )
+
+    use_asm = bool(_ASM_EXP2_OK and q.dtype == torch.float16)
+    if use_asm:
+        try:
+            _launch(True)
+        except Exception:
+            _ASM_EXP2_OK = False
+            _launch(False)
+    else:
+        _launch(False)
+
+    return out

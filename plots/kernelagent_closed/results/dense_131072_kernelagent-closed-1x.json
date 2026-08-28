@@ -1,0 +1,58 @@
+{
+  "accuracy": "PASS",
+  "benchmark_timer": "event",
+  "best_ms": 8327.5400390625,
+  "best_tflops": 33.80049515106792,
+  "config": {
+    "budget_label": "1x",
+    "budget_seconds": 1386.7,
+    "elapsed_seconds": 1386.8139011859894,
+    "selection": {
+      "candidate_id": 5,
+      "hypothesis": "Strength-reduced fixed-shape copy coordinates remove repeated integer div/rem from the hot 512-key-tile loop.",
+      "median_ms": 8338.3935546875,
+      "mutation_family": "copy-index-strength-reduction",
+      "source_sha256": "ce1623b644b08820e57aaafc61f4837a2899a8e5496c189d9867457380a44964",
+      "tflops": 33.75649936220897
+    },
+    "source_sha256": "ce1623b644b08820e57aaafc61f4837a2899a8e5496c189d9867457380a44964"
+  },
+  "flop_model": "softmax_attention_forward",
+  "gpu": "NVIDIA B200",
+  "impl": "kernelagent-closed-1x",
+  "mean_ms": 8337.640950520834,
+  "median_ms": 8338.7998046875,
+  "median_tflops": 33.75485481165168,
+  "mom_median_ms": 8338.7998046875,
+  "mom_median_tflops": 33.75485481165168,
+  "notes": [
+    "KernelAgent Closed wall-clock tuning budget 1386.7s (1x); elapsed 1386.8s.",
+    "Selected source sha256 ce1623b644b08820e57aaafc61f4837a2899a8e5496c189d9867457380a44964; candidate 5; internal search time 8338.3935546875 ms.",
+    "GPT-5.6 had only a controlled CuTeDSL campaign MCP; no shell, web, arbitrary file, subagent, Helion, or FlashAttention access. Generated kernels ran in a network-isolated sandbox."
+  ],
+  "physical_gpu": "7",
+  "power_cap_w": 750,
+  "runs_ms": [
+    8339.55078125,
+    8338.4521484375,
+    8339.0341796875,
+    8338.41015625,
+    8339.6328125,
+    8327.5400390625,
+    8338.7998046875,
+    8338.9482421875,
+    8338.400390625
+  ],
+  "shape": {
+    "biased": 0,
+    "causal": 0,
+    "dtype": "float16",
+    "h": 32,
+    "head_dim": 64,
+    "seq_len": 131072,
+    "z": 2
+  },
+  "std_ms": 3.8154765532138972,
+  "version": "KernelAgent v3-20260730; GPT-5.6; CuTe 4.5.1",
+  "version_label": "KernelAgent v3-20260730 / GPT-5.6 / CuTe 4.5.1"
+}

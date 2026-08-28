@@ -1,0 +1,622 @@
+diff --git a/kernel_perf_agent/kernel_opt/diagnose_prompt/gpu_specs_database.py b/kernel_perf_agent/kernel_opt/diagnose_prompt/gpu_specs_database.py
+index 0c984b4..17d10af 100644
+--- a/kernel_perf_agent/kernel_opt/diagnose_prompt/gpu_specs_database.py
++++ b/kernel_perf_agent/kernel_opt/diagnose_prompt/gpu_specs_database.py
+@@ -30,6 +30,22 @@ Last Updated: January 2026
+ from types import MappingProxyType
+
+ _GPU_SPECS_DATABASE: dict[str, dict[str, object]] = {
++    "NVIDIA B200": {
++        "name": "NVIDIA B200",
++        "architecture": "Blackwell",
++        "peak_fp32_tflops": 90.0,
++        "peak_fp16_tflops": 2250.0,
++        "peak_bf16_tflops": 2250.0,
++        "peak_memory_bw_gbps": 8000,
++        "sm_count": 148,
++        "max_threads_per_sm": 2048,
++        "l1_cache_kb": 256,
++        "l2_cache_mb": 126,
++        "memory_gb": 192,
++        "memory_type": "HBM3e",
++        "form_factor": "SXM",
++        "tdp_w": 750,
++    },
+     # NVIDIA A100 SKUs - SXM4 Variants
+     "NVIDIA A100 SXM4 40GB": {
+         "name": "NVIDIA A100 SXM4 40GB",
+diff --git a/kernel_perf_agent/kernel_opt/profiler/ncu_profiler.py b/kernel_perf_agent/kernel_opt/profiler/ncu_profiler.py
+index ea8a23a..124e8ae 100644
+--- a/kernel_perf_agent/kernel_opt/profiler/ncu_profiler.py
++++ b/kernel_perf_agent/kernel_opt/profiler/ncu_profiler.py
+@@ -166,7 +166,8 @@ def profile_triton_kernel(
+     )
+
+     # Build NCU command
+-    cmd = []
++    sandbox_launcher = os.environ.get("KERNELAGENT_SANDBOX_LAUNCHER")
++    cmd = [sandbox_launcher] if sandbox_launcher else []
+     if use_sudo:
+         cmd.extend(["sudo", "-E", f"--preserve-env={preserve}"])
+
+@@ -183,7 +184,7 @@ def profile_triton_kernel(
+             f"--metrics={METRICS}",
+             f"--launch-skip={launch_skip}",
+             f"--launch-count={launch_count}",
+-            python_executable,
++            "/env/bin/python" if sandbox_launcher else python_executable,
+             str(benchmark_script),
+         ]
+     )
+diff --git a/triton_kernel_agent/agent.py b/triton_kernel_agent/agent.py
+index 84bd5d5..f022a9f 100644
+--- a/triton_kernel_agent/agent.py
++++ b/triton_kernel_agent/agent.py
+@@ -161,7 +161,7 @@ class TritonKernelAgent:
+             matches = re.findall(pattern, response_text, re.DOTALL)
+
+         if matches:
+-            if prefer_kernel_function and len(matches) > 1:
++            if prefer_kernel_function:
+                 # When additional tests are in the prompt the LLM may echo
+                 # wrapper code.  Prefer the block defining kernel_function.
+                 for block in matches:
+@@ -385,7 +385,7 @@ if __name__ == "__main__":
+                     for i, response in enumerate(responses):
+                         kernel_code = self._extract_code_from_response(
+                             response.content,
+-                            prefer_kernel_function=self._has_multiple_tests,
++                            prefer_kernel_function=True,
+                         )
+                         if kernel_code:
+                             kernels.append(kernel_code)
+@@ -403,7 +403,7 @@ if __name__ == "__main__":
+                         )
+                         kernel_code = self._extract_code_from_response(
+                             response_text,
+-                            prefer_kernel_function=self._has_multiple_tests,
++                            prefer_kernel_function=True,
+                         )
+
+                         if kernel_code:
+@@ -426,7 +426,7 @@ if __name__ == "__main__":
+
+             except Exception as e:
+                 self.logger.error(f"Error generating kernels with LLM API: {e}")
+-                # Fall back to mock implementation
++                raise
+
+         # Mock kernel generation (fallback)
+         self.logger.info(f"Generating {num_seeds} kernel seeds (mock implementation)")
+diff --git a/triton_kernel_agent/manager.py b/triton_kernel_agent/manager.py
+index 015fbac..0bfe818 100644
+--- a/triton_kernel_agent/manager.py
++++ b/triton_kernel_agent/manager.py
+@@ -102,8 +102,12 @@ class WorkerManager:
+         """Create temporary working directories for workers."""
+         workdirs = []
+         try:
++            temp_root = self.log_dir / "worker_tmp"
++            temp_root.mkdir(parents=True, exist_ok=True)
+             for i in range(self.num_workers):
+-                workdir = Path(tempfile.mkdtemp(prefix=f"worker_{i}_"))
++                workdir = Path(
++                    tempfile.mkdtemp(prefix=f"worker_{i}_", dir=temp_root)
++                )
+                 workdirs.append(workdir)
+                 self.logger.info(f"Created workdir for worker {i}: {workdir}")
+             yield workdirs
+diff --git a/triton_kernel_agent/opt_manager.py b/triton_kernel_agent/opt_manager.py
+index 2ccd51f..4ede8c9 100644
+--- a/triton_kernel_agent/opt_manager.py
++++ b/triton_kernel_agent/opt_manager.py
+@@ -161,6 +161,9 @@ class OptimizationManager:
+         self.high_reasoning_effort = high_reasoning_effort
+         self.bottleneck_override = bottleneck_override
+         self.worker_kwargs = worker_kwargs
++        self.benchmark_compile_reference = self.worker_kwargs.pop(
++            "benchmark_compile_reference", True
++        )
+
+         # Store template overrides (also stays in worker_kwargs for forwarding)
+         self.templates_config = worker_kwargs.get("templates")
+@@ -316,6 +319,15 @@ class OptimizationManager:
+                             log_dir=self.log_dir,
+                             artifacts_dir=self.log_dir / "baseline_profiles",
+                             profiling_semaphore=self.profiling_semaphore,
++                            ncu_timeout_seconds=self.worker_kwargs.get(
++                                "ncu_timeout_seconds"
++                            ),
++                            ncu_launch_skip=self.worker_kwargs.get(
++                                "ncu_launch_skip", 3
++                            ),
++                            ncu_launch_count=self.worker_kwargs.get(
++                                "ncu_launch_count", 20
++                            ),
+                         ),
+                     )
+                 except Exception as e:
+@@ -455,12 +467,19 @@ class OptimizationManager:
+         pytorch_baseline = self._benchmark_pytorch_baseline(problem_file)
+
+         # Benchmark torch.compile baseline
+-        pytorch_compile_time = self._benchmark_pytorch_compile(problem_file)
++        pytorch_compile_time = (
++            self._benchmark_pytorch_compile(problem_file)
++            if self.benchmark_compile_reference
++            else float("inf")
++        )
+
+         # Benchmark the initial kernel
+         initial_kernel_time = self._benchmark_initial_kernel(
+             initial_kernel, problem_file
+         )
++        initial_entry.metrics.time_ms = initial_kernel_time
++        self.database.add_program(initial_entry)
++        self.database.save()
+
+         # Round loop
+         round_num = 0
+diff --git a/triton_kernel_agent/opt_worker.py b/triton_kernel_agent/opt_worker.py
+index 7c70a5a..8fdb7bc 100644
+--- a/triton_kernel_agent/opt_worker.py
++++ b/triton_kernel_agent/opt_worker.py
+@@ -76,8 +76,13 @@ class OptimizationWorker:
+         high_reasoning_effort: bool = True,
+         gpu_name: str | None = None,
+         ncu_bin_path: str | None = None,
++        ncu_timeout_seconds: int = 360,
++        ncu_launch_skip: int = 3,
++        ncu_launch_count: int = 20,
+         benchmark_warmup: int = 25,
+         benchmark_repeat: int = 100,
++        benchmark_timing_method: str = "cuda_event",
++        benchmark_dtype: str = "bfloat16",
+         benchmark_lock: Any | None = None,
+         profiling_semaphore: Any | None = None,
+         pytorch_baseline_time: float | None = None,
+@@ -147,8 +152,13 @@ class OptimizationWorker:
+         self.target_platform = target_platform
+         self.gpu_name = gpu_name
+         self.ncu_bin_path = ncu_bin_path
++        self.ncu_timeout_seconds = ncu_timeout_seconds
++        self.ncu_launch_skip = ncu_launch_skip
++        self.ncu_launch_count = ncu_launch_count
+         self.benchmark_warmup = benchmark_warmup
+         self.benchmark_repeat = benchmark_repeat
++        self.benchmark_timing_method = benchmark_timing_method
++        self.benchmark_dtype = benchmark_dtype
+         self.roofline_config = roofline_config or RooflineConfig()
+         self.use_rag = use_rag
+
+@@ -249,6 +259,9 @@ class OptimizationWorker:
+             log_dir=self.log_dir,
+             artifacts_dir=self.artifact_dir,
+             ncu_bin_path=self.ncu_bin_path,
++            ncu_timeout_seconds=self.ncu_timeout_seconds,
++            ncu_launch_skip=self.ncu_launch_skip,
++            ncu_launch_count=self.ncu_launch_count,
+             profiling_semaphore=self.profiling_semaphore,
+             openai_model=self.openai_model,
+             gpu_name=self.gpu_name,
+@@ -284,6 +297,8 @@ class OptimizationWorker:
+             worker_id=self.worker_id,
+             warmup=self.benchmark_warmup,
+             repeat=self.benchmark_repeat,
++            timing_method=self.benchmark_timing_method,
++            dtype=self.benchmark_dtype,
+         )
+
+         # Profiler
+@@ -299,6 +314,9 @@ class OptimizationWorker:
+                 artifacts_dir=self.artifact_dir,
+                 logs_dir=self.log_dir,
+                 ncu_bin_path=self.ncu_bin_path,
++                ncu_timeout_seconds=self.ncu_timeout_seconds,
++                ncu_launch_skip=self.ncu_launch_skip,
++                ncu_launch_count=self.ncu_launch_count,
+                 profiling_semaphore=self.profiling_semaphore,
+             )
+
+diff --git a/triton_kernel_agent/opt_worker_component/benchmarking/benchmark.py b/triton_kernel_agent/opt_worker_component/benchmarking/benchmark.py
+index 7bbf2a6..f6cbbca 100644
+--- a/triton_kernel_agent/opt_worker_component/benchmarking/benchmark.py
++++ b/triton_kernel_agent/opt_worker_component/benchmarking/benchmark.py
+@@ -92,6 +92,7 @@ class Benchmark:
+         warmup: int = 25,
+         repeat: int = 100,
+         timing_method: str = "cuda_event",
++        dtype: str = "bfloat16",
+     ):
+         """Initialize the benchmark.
+
+@@ -110,6 +111,7 @@ class Benchmark:
+         self.warmup = warmup
+         self.repeat = repeat
+         self.timing_method = timing_method
++        self.dtype = dtype
+
+     def benchmark_kernel(
+         self,
+@@ -154,6 +156,8 @@ class Benchmark:
+                     str(self.warmup),
+                     "--repeat",
+                     str(self.repeat),
++                    "--dtype",
++                    self.dtype,
+                     "--json",
+                     str(results_json),
+                     "--quiet",
+@@ -229,7 +233,7 @@ class Benchmark:
+                 model, inputs = prepare_pytorch_model(
+                     problem_file=problem_file,
+                     device="cuda",
+-                    dtype=dtype,
++                    dtype=dtype or getattr(torch, self.dtype),
+                 )
+
+                 if self.timing_method == "do_bench":
+@@ -287,7 +291,7 @@ class Benchmark:
+                 model, inputs = prepare_pytorch_model(
+                     problem_file=problem_file,
+                     device="cuda",
+-                    dtype=dtype,
++                    dtype=dtype or getattr(torch, self.dtype),
+                 )
+
+                 model = torch.compile(model)
+diff --git a/triton_kernel_agent/opt_worker_component/orchestrator/optimization_orchestrator.py b/triton_kernel_agent/opt_worker_component/orchestrator/optimization_orchestrator.py
+index 5479e46..727c12b 100644
+--- a/triton_kernel_agent/opt_worker_component/orchestrator/optimization_orchestrator.py
++++ b/triton_kernel_agent/opt_worker_component/orchestrator/optimization_orchestrator.py
+@@ -918,6 +918,7 @@ class OptimizationOrchestrator:
+             # Extract code
+             optimized_kernel = self.verification_worker._extract_code_from_response(
+                 response_text,
++                prefer_kernel_function=True,
+             )
+
+             if not optimized_kernel or len(optimized_kernel) < 100:
+diff --git a/triton_kernel_agent/opt_worker_component/profiling/kernel_profiler.py b/triton_kernel_agent/opt_worker_component/profiling/kernel_profiler.py
+index 6f3f6ff..2aa6645 100644
+--- a/triton_kernel_agent/opt_worker_component/profiling/kernel_profiler.py
++++ b/triton_kernel_agent/opt_worker_component/profiling/kernel_profiler.py
+@@ -86,6 +86,8 @@ class KernelProfiler:
+         logs_dir: Path,
+         ncu_bin_path: str | None = None,
+         ncu_timeout_seconds: int = DEFAULT_NCU_TIMEOUT_SECONDS,
++        ncu_launch_skip: int = 3,
++        ncu_launch_count: int = 20,
+         profiling_semaphore: Any | None = None,
+     ):
+         """
+@@ -106,6 +108,8 @@ class KernelProfiler:
+         self.logs_dir = logs_dir
+         self.ncu_bin_path = ncu_bin_path
+         self.ncu_timeout_seconds = ncu_timeout_seconds
++        self.ncu_launch_skip = ncu_launch_skip
++        self.ncu_launch_count = ncu_launch_count
+         self.profiling_semaphore = profiling_semaphore
+         self.wrapper_factory = NCUWrapperFactory(logger)
+
+@@ -236,8 +240,8 @@ class KernelProfiler:
+                     workdir=self.artifacts_dir,
+                     out_csv=csv_file,
+                     ncu_bin=self.ncu_bin_path,
+-                    launch_skip=3,  # Skip warmup iterations, capture final run
+-                    launch_count=20,
++                    launch_skip=self.ncu_launch_skip,
++                    launch_count=self.ncu_launch_count,
+                     timeout=self.ncu_timeout_seconds,
+                 )
+
+diff --git a/triton_kernel_agent/opt_worker_component/searching/history/json_db.py b/triton_kernel_agent/opt_worker_component/searching/history/json_db.py
+index 1102d7c..d8cf5b5 100644
+--- a/triton_kernel_agent/opt_worker_component/searching/history/json_db.py
++++ b/triton_kernel_agent/opt_worker_component/searching/history/json_db.py
+@@ -111,10 +111,12 @@ class JSONProgramDatabase(ProgramDatabase):
+
+         data = {"programs": [self._entry_to_dict(p) for p in self.programs.values()]}
+
+-        with open(self.path, "w") as f:
++        temp_path = self.path.with_suffix(self.path.suffix + ".tmp")
++        with open(temp_path, "w") as f:
+             fcntl.flock(f.fileno(), fcntl.LOCK_EX)
+             json.dump(data, f, indent=2, default=str)
+             fcntl.flock(f.fileno(), fcntl.LOCK_UN)
++        temp_path.replace(self.path)
+
+     def load(self) -> None:
+         """Load from JSON."""
+diff --git a/triton_kernel_agent/platform/nvidia.py b/triton_kernel_agent/platform/nvidia.py
+index e2ed359..2357f81 100644
+--- a/triton_kernel_agent/platform/nvidia.py
++++ b/triton_kernel_agent/platform/nvidia.py
+@@ -104,12 +104,18 @@ class NvidiaBenchmarker(KernelBenchmarker):
+         benchmark_lock: Any,
+         warmup: int = 25,
+         repeat: int = 100,
++        worker_kwargs: dict[str, Any] | None = None,
+     ) -> None:
++        worker_kwargs = worker_kwargs or {}
+         self.log_dir = log_dir
+         self.logger = logger
+         self.benchmark_lock = benchmark_lock
+-        self.warmup = warmup
+-        self.repeat = repeat
++        self.warmup = worker_kwargs.get("benchmark_warmup", warmup)
++        self.repeat = worker_kwargs.get("benchmark_repeat", repeat)
++        self.timing_method = worker_kwargs.get(
++            "benchmark_timing_method", "cuda_event"
++        )
++        self.dtype = worker_kwargs.get("benchmark_dtype", "bfloat16")
+
+     def _get_benchmarker(self):
+         from triton_kernel_agent.opt_worker_component.benchmarking.benchmark import (
+@@ -125,6 +131,8 @@ class NvidiaBenchmarker(KernelBenchmarker):
+             worker_id=-1,
+             warmup=self.warmup,
+             repeat=self.repeat,
++            timing_method=self.timing_method,
++            dtype=self.dtype,
+         )
+
+     def benchmark_kernel(
+@@ -480,6 +488,8 @@ class NvidiaKernelProfiler(KernelProfilerBase):
+         artifacts_dir: Path | None = None,
+         ncu_bin_path: str | None = None,
+         ncu_timeout_seconds: int | None = None,
++        ncu_launch_skip: int = 3,
++        ncu_launch_count: int = 20,
+         profiling_semaphore: Any | None = None,
+     ) -> None:
+         self._logger = logger or logging.getLogger(__name__)
+@@ -487,6 +497,8 @@ class NvidiaKernelProfiler(KernelProfilerBase):
+         self._artifacts_dir = Path(artifacts_dir) if artifacts_dir else None
+         self._ncu_bin_path = ncu_bin_path
+         self._ncu_timeout_seconds = ncu_timeout_seconds
++        self._ncu_launch_skip = ncu_launch_skip
++        self._ncu_launch_count = ncu_launch_count
+         self._profiling_semaphore = profiling_semaphore
+         self._delegate: Any | None = None
+
+@@ -504,6 +516,8 @@ class NvidiaKernelProfiler(KernelProfilerBase):
+                 "logs_dir": self._log_dir,
+                 "ncu_bin_path": self._ncu_bin_path,
+                 "profiling_semaphore": self._profiling_semaphore,
++                "ncu_launch_skip": self._ncu_launch_skip,
++                "ncu_launch_count": self._ncu_launch_count,
+             }
+             if self._ncu_timeout_seconds is not None:
+                 kwargs["ncu_timeout_seconds"] = self._ncu_timeout_seconds
+diff --git a/triton_kernel_agent/worker.py b/triton_kernel_agent/worker.py
+index e594d74..a38bcb7 100644
+--- a/triton_kernel_agent/worker.py
++++ b/triton_kernel_agent/worker.py
+@@ -233,7 +233,7 @@ class VerificationWorker:
+             matches = re.findall(pattern, response_text, re.DOTALL)
+
+         if matches:
+-            if prefer_kernel_function and len(matches) > 1:
++            if prefer_kernel_function:
+                 # When additional tests are in the prompt the LLM may echo
+                 # wrapper code.  Prefer the block defining kernel_function.
+                 for block in matches:
+@@ -335,8 +335,14 @@ class VerificationWorker:
+             for test_file in self.test_files:
+                 if not test_file.exists():
+                     continue
++                test_python = os.environ.get("KERNELAGENT_TEST_PYTHON")
++                command = (
++                    [test_python, str(test_file)]
++                    if test_python
++                    else [sys.executable, str(test_file)]
++                )
+                 result = subprocess.run(
+-                    [sys.executable, str(test_file)],
++                    command,
+                     cwd=str(self.workdir),
+                     capture_output=True,
+                     text=True,
+@@ -433,7 +439,7 @@ class VerificationWorker:
+                 # Extract refined kernel from response
+                 refined_kernel = self._extract_code_from_response(
+                     response_text,
+-                    prefer_kernel_function=getattr(self, "_has_multiple_tests", False),
++                    prefer_kernel_function=True,
+                 )
+                 malformed_reason = self._validate_kernel_candidate(refined_kernel)
+
+diff --git a/utils/providers/__init__.py b/utils/providers/__init__.py
+index 7a1207d..21c858a 100644
+--- a/utils/providers/__init__.py
++++ b/utils/providers/__init__.py
+@@ -17,6 +17,7 @@
+ from .base import BaseProvider, LLMResponse
+ from .openai_provider import OpenAIProvider
+ from .anthropic_provider import AnthropicProvider
++from .claude_cli_provider import ClaudeCLIProvider
+ from .relay_provider import RelayProvider
+ from .models import get_model_provider, get_available_models, is_model_available
+
+@@ -25,6 +26,7 @@ __all__ = [
+     "LLMResponse",
+     "OpenAIProvider",
+     "AnthropicProvider",
++    "ClaudeCLIProvider",
+     "RelayProvider",
+     "get_model_provider",
+     "get_available_models",
+diff --git a/utils/providers/available_models.py b/utils/providers/available_models.py
+index 0c5080f..49800c4 100644
+--- a/utils/providers/available_models.py
++++ b/utils/providers/available_models.py
+@@ -17,11 +17,17 @@
+ from utils.providers.model_config import ModelConfig
+ from utils.providers.openai_provider import OpenAIProvider
+ from utils.providers.anthropic_provider import AnthropicProvider
++from utils.providers.claude_cli_provider import ClaudeCLIProvider
+ from utils.providers.relay_provider import RelayProvider
+
+
+ # Registry of all available models (external/OSS version)
+ AVAILABLE_MODELS = [
++    ModelConfig(
++        name="claude-opus-5",
++        provider_classes=[ClaudeCLIProvider],
++        description="Claude Opus 5 via the local tool-free Claude CLI",
++    ),
+     ModelConfig(
+         name="o4-mini",
+         provider_classes=[OpenAIProvider],
+diff --git a/utils/providers/claude_cli_provider.py b/utils/providers/claude_cli_provider.py
+new file mode 100644
+index 0000000..9877616
+--- /dev/null
++++ b/utils/providers/claude_cli_provider.py
+@@ -0,0 +1,145 @@
++# Copyright (c) Meta Platforms, Inc. and affiliates.
++
++"""Tool-free Claude Code CLI transport for local KernelAgent experiments."""
++
++from __future__ import annotations
++
++import json
++import os
++import shutil
++import subprocess
++from pathlib import Path
++from typing import Any
++
++from .base import BaseProvider
++from .base import LLMResponse
++
++
++class ClaudeCLIProvider(BaseProvider):
++    """Invoke Claude through the local launcher without granting agent tools."""
++
++    def _initialize_client(self) -> None:
++        self.client = shutil.which(os.environ.get("KERNELAGENT_CLAUDE_BIN", "claude"))
++
++    def get_response(
++        self, model_name: str, messages: list[dict[str, str]], **kwargs: Any
++    ) -> LLMResponse:
++        if not self.is_available():
++            raise RuntimeError("Claude CLI is not available")
++
++        prompt = "\n\n".join(
++            f"<{message['role']}>\n{message['content']}\n</{message['role']}>"
++            for message in messages
++        )
++        effort = "high"
++        command = [
++            self.client,
++            "--safe-mode",
++            "--disable-slash-commands",
++            "--tools",
++            "",
++            "--strict-mcp-config",
++            "--mcp-config",
++            '{"mcpServers":{}}',
++            "--no-session-persistence",
++            "--permission-mode",
++            "dontAsk",
++            "--model",
++            model_name,
++            "--effort",
++            effort,
++            "--max-budget-usd",
++            os.environ.get("KERNELAGENT_CLAUDE_MAX_BUDGET_USD", "5.00"),
++            "--output-format",
++            "json",
++            "--system-prompt",
++            "You are the language model inside KernelAgent. Follow the supplied prompt. You have no tools.",
++            "--print",
++        ]
++
++        env = os.environ.copy()
++        env.pop("META_CLAUDE_DANGEROUSLY_DISABLE_LINUX_SANDBOX", None)
++        env.pop("META_CLAUDE_ENABLE_WEB_TOOLS", None)
++        cwd = Path(
++            os.environ.get(
++                "KERNELAGENT_CLAUDE_CWD", "/tmp/kernelagent-study/claude-broker"
++            )
++        )
++        cwd.mkdir(parents=True, exist_ok=True)
++        timeout_s = int(os.environ.get("KERNELAGENT_CLAUDE_TIMEOUT_S", "900"))
++
++        result = subprocess.run(
++            command,
++            input=prompt,
++            text=True,
++            capture_output=True,
++            cwd=cwd,
++            env=env,
++            timeout=timeout_s,
++        )
++        if result.returncode != 0:
++            raise RuntimeError(
++                f"Claude CLI failed with exit {result.returncode}: {result.stderr[-2000:]}"
++            )
++
++        payload = json.loads(result.stdout)
++        if payload.get("is_error") or payload.get("subtype") != "success":
++            raise RuntimeError(f"Claude CLI returned an error: {payload}")
++
++        usage_by_model = payload.get("modelUsage", {})
++        canonical_models = {
++            usage.get("canonicalModel", name)
++            for name, usage in usage_by_model.items()
++        }
++        if canonical_models != {model_name}:
++            raise RuntimeError(
++                f"Requested {model_name!r}, but Claude used {sorted(canonical_models)!r}"
++            )
++        if any(usage.get("webSearchRequests", 0) for usage in usage_by_model.values()):
++            raise RuntimeError("Claude unexpectedly used web search")
++
++        audit_path = os.environ.get("KERNELAGENT_CLAUDE_AUDIT_LOG")
++        if audit_path:
++            with Path(audit_path).open("a") as audit_file:
++                audit_file.write(
++                    json.dumps(
++                        {
++                            "requested_model": model_name,
++                            "canonical_models": sorted(canonical_models),
++                            "duration_ms": payload.get("duration_ms"),
++                            "duration_api_ms": payload.get("duration_api_ms"),
++                            "total_cost_usd": payload.get("total_cost_usd"),
++                            "model_usage": usage_by_model,
++                        }
++                    )
++                    + "\n"
++                )
++
++        return LLMResponse(
++            content=payload["result"],
++            model=model_name,
++            provider=self.name,
++            usage={
++                "duration_ms": payload.get("duration_ms"),
++                "duration_api_ms": payload.get("duration_api_ms"),
++                "total_cost_usd": payload.get("total_cost_usd"),
++                "model_usage": usage_by_model,
++            },
++            response_id=payload.get("session_id"),
++        )
++
++    def get_multiple_responses(
++        self,
++        model_name: str,
++        messages: list[dict[str, str]],
++        n: int = 1,
++        **kwargs: Any,
++    ) -> list[LLMResponse]:
++        return [self.get_response(model_name, messages, **kwargs) for _ in range(n)]
++
++    def is_available(self) -> bool:
++        return self.client is not None
++
++    @property
++    def name(self) -> str:
++        return "claude-cli"

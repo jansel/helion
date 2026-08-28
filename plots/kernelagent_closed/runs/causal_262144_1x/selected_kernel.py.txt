@@ -1,0 +1,59 @@
+# Optimized by KernelAgent-Oink(https://github.com/meta-pytorch/KernelAgent)
+import torch
+import cutlass
+import cutlass.cute as cute
+import cutlass.utils as utils
+from cutlass.cute.nvgpu import warp
+from cutlass.cute.runtime import from_dlpack
+F16=cutlass.Float16; F32=cutlass.Float32
+M=128; N=256; D=64; SN=266; SK=72; SO=68
+@cute.kernel
+def flash8(q:cute.Tensor,k:cute.Tensor,v:cute.Tensor,o:cute.Tensor,wm:cute.TiledMma):
+ tid,_,_=cute.arch.thread_idx(); bx,by,_=cute.arch.block_idx(); batch=by//32; head=by-batch*32; qs=bx*M; row=tid%M; half=tid//M; sm=utils.SmemAllocator(); sS=sm.allocate_tensor(F16,cute.make_layout((M,N),stride=(SN,1)),byte_alignment=16); sK=sm.allocate_tensor(F16,cute.make_layout((N,D),stride=(SK,1)),byte_alignment=16); sV=sm.allocate_tensor(F16,cute.make_layout((D,N),stride=(SN,1)),byte_alignment=16); sO=sm.allocate_tensor(F32,cute.make_layout((M,D),stride=(SO,1)),byte_alignment=16); tmp=sm.allocate_tensor(F32,cute.make_layout(256),byte_alignment=16); nmax=sm.allocate_tensor(F32,cute.make_layout(M),byte_alignment=16); scales=sm.allocate_tensor(F32,cute.make_layout(M),byte_alignment=16); sQ=cute.make_tensor(sS.iterator,cute.make_layout((M,D),stride=(SK,1)))
+ for i in cutlass.range(32):
+  x=tid+i*256; r=x//D; d=x-r*D; sQ[r,d]=q[batch,head,qs+r,d]; sO[r,d]=0.0
+ cute.arch.sync_threads(); sl=wm.get_slice(tid); pqa=sl.partition_A(sQ); rqa=cute.make_rmem_tensor(pqa.shape,F16); cute.autovec_copy(pqa,rqa); rm=-1e30; rl=0.0; l2e=1.4426950408889634
+ for kt in cutlass.range(bx//2+1):
+  ks=kt*N
+  for i in cutlass.range(64):
+   x=tid+i*256; r=x//D; d=x-r*D; sK[r,d]=k[batch,head,ks+r,d]; sV[d,r]=v[batch,head,ks+r,d]
+  cute.arch.sync_threads()
+  for nb in cutlass.range_constexpr(32):
+   bt=cute.make_tensor(sK.iterator+nb*8*SK,cute.make_layout((8,D),stride=(SK,1))); ct=cute.make_tensor(sS.iterator+nb*8,cute.make_layout((M,8),stride=(SN,1))); pb=sl.partition_B(bt); pc=sl.partition_C(ct); rb=cute.make_rmem_tensor(pb.shape,F16); rc=cute.make_rmem_tensor(pc.shape,F32); cute.autovec_copy(pb,rb)
+   for z in cutlass.range_constexpr(cute.size(rc)): rc[z]=0.0
+   cute.gemm(wm,rc,rqa,rb,rc); hh=cute.make_rmem_tensor(pc.shape,F16); hh.store(rc.load().to(F16)); cute.autovec_copy(hh,pc)
+  cute.arch.sync_threads(); lm=-1e30; base=half*128
+  for j in cutlass.range(128):
+   c=base+j; ss=sS[row,c].to(F32)*0.125
+   if ks+c>qs+row: ss=-1e30
+   lm=cute.arch.fmax(lm,ss)
+  tmp[tid]=lm; cute.arch.sync_threads()
+  if tid<M:
+   nm=cute.arch.fmax(tmp[tid],tmp[tid+M]); nm=cute.arch.fmax(rm,nm); nmax[tid]=nm; scales[tid]=cute.arch.exp2((rm-nm)*l2e)
+  cute.arch.sync_threads(); smm=0.0; nm2=nmax[row]
+  for j2 in cutlass.range(128):
+   c2=base+j2; pp=cute.arch.exp2((sS[row,c2].to(F32)*0.125-nm2)*l2e)
+   if ks+c2>qs+row: pp=0.0
+   sS[row,c2]=pp.to(F16); smm=smm+pp
+  tmp[tid]=smm; cute.arch.sync_threads()
+  if tid<M:
+   sc=scales[tid]; rl=rl*sc+tmp[tid]+tmp[tid+M]; rm=nmax[tid]
+  sc2=scales[row]
+  for j3 in cutlass.range(32):
+   d0=half*32+j3; sO[row,d0]=sO[row,d0]*sc2
+  cute.arch.sync_threads(); ppa=sl.partition_A(sS); rpa=cute.make_rmem_tensor(ppa.shape,F16); cute.autovec_copy(ppa,rpa)
+  for db in cutlass.range_constexpr(8):
+   bt2=cute.make_tensor(sV.iterator+db*8*SN,cute.make_layout((8,N),stride=(SN,1))); ct2=cute.make_tensor(sO.iterator+db*8,cute.make_layout((M,8),stride=(SO,1))); pb2=sl.partition_B(bt2); pc2=sl.partition_C(ct2); rb2=cute.make_rmem_tensor(pb2.shape,F16); rc2=cute.make_rmem_tensor(pc2.shape,F32); old=cute.make_rmem_tensor(pc2.shape,F32); cute.autovec_copy(pb2,rb2); cute.autovec_copy(pc2,old)
+   for z2 in cutlass.range_constexpr(cute.size(rc2)): rc2[z2]=0.0
+   cute.gemm(wm,rc2,rpa,rb2,rc2)
+   for z3 in cutlass.range_constexpr(cute.size(rc2)): rc2[z3]=rc2[z3]+old[z3]
+   cute.autovec_copy(rc2,pc2)
+  cute.arch.sync_threads()
+ if tid<M:
+  inv=1.0/rl
+  for d3 in cutlass.range(D): o[batch,head,qs+tid,d3]=(sO[tid,d3]*inv).to(F16)
+@cute.jit
+def launch(q:cute.Tensor,k:cute.Tensor,v:cute.Tensor,o:cute.Tensor):
+ wm=cute.make_tiled_mma(warp.MmaF16BF16Op(F16,F32,(16,8,16)),cute.make_layout((8,1,1))); flash8(q,k,v,o,wm).launch(grid=(2048,64,1),block=(256,1,1))
+def kernel_function(q,k,v):
+ o=torch.empty_like(q); launch(from_dlpack(q,assumed_align=32),from_dlpack(k,assumed_align=32),from_dlpack(v,assumed_align=32),from_dlpack(o,assumed_align=32)); return o

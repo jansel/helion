@@ -1,0 +1,151 @@
+from __future__ import annotations
+
+import torch
+import triton
+import triton.language as tl
+
+
+_CONFIGS = [
+    # BLOCK_N=128 + fewer stages: less SMEM/block, half the accumulator rescales
+    triton.Config({"BLOCK_M": 128, "BLOCK_N": 128}, num_warps=8, num_stages=2),
+    triton.Config({"BLOCK_M": 128, "BLOCK_N": 128}, num_warps=8, num_stages=3),
+    triton.Config({"BLOCK_M": 64, "BLOCK_N": 128}, num_warps=8, num_stages=3),
+    # reference/baseline shape (guards against regression)
+    triton.Config({"BLOCK_M": 128, "BLOCK_N": 64}, num_warps=8, num_stages=3),
+    triton.Config({"BLOCK_M": 128, "BLOCK_N": 64}, num_warps=8, num_stages=4),
+]
+
+
+@triton.autotune(configs=_CONFIGS, key=["N_CTX", "HEAD_DIM"])
+@triton.jit
+def _attn_fwd_kernel(
+    Q, K, V, Out,
+    stride_qz, stride_qh, stride_qm, stride_qd,
+    stride_kz, stride_kh, stride_kn, stride_kd,
+    stride_vz, stride_vh, stride_vn, stride_vd,
+    stride_oz, stride_oh, stride_om, stride_od,
+    H, N_CTX, qk_scale,
+    HEAD_DIM: tl.constexpr,
+    BLOCK_M: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+):
+    start_m = tl.program_id(0)
+    off_hz = tl.program_id(1)
+    off_z = off_hz // H
+    off_h = off_hz % H
+
+    dtype = Q.dtype.element_ty
+
+    offs_m = start_m * BLOCK_M + tl.arange(0, BLOCK_M)
+    offs_n = tl.arange(0, BLOCK_N)
+    offs_d = tl.arange(0, HEAD_DIM)
+    m_mask = offs_m < N_CTX
+
+    # ---- load Q once and pre-scale it (folds sm_scale * log2(e) out of the loop) ----
+    q_ptrs = (
+        Q
+        + off_z * stride_qz
+        + off_h * stride_qh
+        + offs_m[:, None] * stride_qm
+        + offs_d[None, :] * stride_qd
+    )
+    q = tl.load(q_ptrs, mask=m_mask[:, None], other=0.0)
+    q = (q.to(tl.float32) * qk_scale).to(dtype)
+
+    k_ptrs = (
+        K
+        + off_z * stride_kz
+        + off_h * stride_kh
+        + offs_n[None, :] * stride_kn
+        + offs_d[:, None] * stride_kd
+    )
+    v_ptrs = (
+        V
+        + off_z * stride_vz
+        + off_h * stride_vh
+        + offs_n[:, None] * stride_vn
+        + offs_d[None, :] * stride_vd
+    )
+
+    m_i = tl.full([BLOCK_M], -float("inf"), dtype=tl.float32)
+    l_i = tl.zeros([BLOCK_M], dtype=tl.float32)
+    acc = tl.zeros([BLOCK_M, HEAD_DIM], dtype=tl.float32)
+
+    n_full = (N_CTX // BLOCK_N) * BLOCK_N
+
+    # ---------------- main loop: no masks, no scale-mul, pointer increments ----------------
+    for _ in tl.range(0, n_full, BLOCK_N):
+        k = tl.load(k_ptrs)
+        qk = tl.dot(q, k)
+
+        m_ij = tl.maximum(m_i, tl.max(qk, 1))
+        p = tl.math.exp2(qk - m_ij[:, None])
+        alpha = tl.math.exp2(m_i - m_ij)
+
+        l_i = l_i * alpha + tl.sum(p, 1)
+        acc = acc * alpha[:, None]
+
+        v = tl.load(v_ptrs)
+        acc = tl.dot(p.to(dtype), v, acc)
+
+        m_i = m_ij
+        k_ptrs += BLOCK_N * stride_kn
+        v_ptrs += BLOCK_N * stride_vn
+
+    # ---------------- masked tail block (compiled out of the hot loop) ----------------
+    if n_full < N_CTX:
+        n_idx = n_full + offs_n
+        n_msk = n_idx < N_CTX
+
+        k = tl.load(k_ptrs, mask=n_msk[None, :], other=0.0)
+        qk = tl.dot(q, k)
+        qk = tl.where(n_msk[None, :], qk, -float("inf"))
+
+        m_ij = tl.maximum(m_i, tl.max(qk, 1))
+        p = tl.math.exp2(qk - m_ij[:, None])
+        alpha = tl.math.exp2(m_i - m_ij)
+
+        l_i = l_i * alpha + tl.sum(p, 1)
+        acc = acc * alpha[:, None]
+
+        v = tl.load(v_ptrs, mask=n_msk[:, None], other=0.0)
+        acc = tl.dot(p.to(dtype), v, acc)
+
+    # ---------------- normalize + store ----------------
+    acc = acc * (1.0 / l_i)[:, None]
+    o_ptrs = (
+        Out
+        + off_z * stride_oz
+        + off_h * stride_oh
+        + offs_m[:, None] * stride_om
+        + offs_d[None, :] * stride_od
+    )
+    tl.store(o_ptrs, acc.to(Out.dtype.element_ty), mask=m_mask[:, None])
+
+
+def kernel_function(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor) -> torch.Tensor:
+    assert q.is_cuda and k.is_cuda and v.is_cuda, "inputs must be CUDA tensors"
+    assert q.dim() == 4 and k.dim() == 4 and v.dim() == 4, "expected 4D [Z,H,N,D]"
+    assert q.shape == k.shape == v.shape, "q/k/v must have identical shapes"
+    assert q.dtype == k.dtype == v.dtype, "q/k/v must share a dtype"
+
+    Z, H, N_CTX, HEAD_DIM = q.shape
+    assert HEAD_DIM in (16, 32, 64, 128, 256), "unsupported head dim"
+
+    out = torch.empty_like(q)
+
+    # 1/sqrt(d) pre-multiplied by log2(e) so the kernel can use exp2 (MUFU-friendly).
+    qk_scale = (1.0 / (HEAD_DIM ** 0.5)) * 1.4426950408889634
+
+    grid = lambda META: (triton.cdiv(N_CTX, META["BLOCK_M"]), Z * H)
+
+    _attn_fwd_kernel[grid](
+        q, k, v, out,
+        q.stride(0), q.stride(1), q.stride(2), q.stride(3),
+        k.stride(0), k.stride(1), k.stride(2), k.stride(3),
+        v.stride(0), v.stride(1), v.stride(2), v.stride(3),
+        out.stride(0), out.stride(1), out.stride(2), out.stride(3),
+        H, N_CTX, qk_scale,
+        HEAD_DIM=HEAD_DIM,
+    )
+    return out

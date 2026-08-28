@@ -1,0 +1,502 @@
+from __future__ import annotations
+
+import argparse
+import contextlib
+import hashlib
+import importlib.metadata
+import json
+import math
+import multiprocessing as mp
+import os
+import shutil
+import signal
+import subprocess
+import sys
+import time
+from pathlib import Path
+
+
+MODEL = "claude-opus-5"
+SOURCE_ROOT = Path("/tmp/kernelagent-study/KernelAgent")
+SHIMS_ROOT = Path("/tmp/kernelagent-study/shims")
+SANDBOX_LAUNCHER = Path("/tmp/kernelagent-study/sandbox_launcher.sh")
+SEED = 2026080106
+GENERATION_TEST_TIMEOUT_S = 120
+_ACTIVE_PROCESS_GROUPS: set[int] = set()
+_RESTORE_SIGNAL_MASK_CODE = (
+    "import os,signal,sys;"
+    "signal.pthread_sigmask(signal.SIG_SETMASK,"
+    "{int(value) for value in sys.argv[1].split(',') if value});"
+    "os.execvpe(sys.argv[2],sys.argv[2:],os.environ)"
+)
+
+
+def command_restoring_signal_mask(
+    command: list[str], previous_mask: set[signal.Signals]
+) -> list[str]:
+    serialized_mask = ",".join(str(int(value)) for value in sorted(previous_mask))
+    return [sys.executable, "-c", _RESTORE_SIGNAL_MASK_CODE, serialized_mask, *command]
+
+
+def terminate_process_group(process: subprocess.Popen[str]) -> None:
+    if process.poll() is not None:
+        return
+    with contextlib.suppress(ProcessLookupError):
+        os.killpg(process.pid, signal.SIGTERM)
+    try:
+        process.wait(timeout=5)
+    except subprocess.TimeoutExpired:
+        with contextlib.suppress(ProcessLookupError):
+            os.killpg(process.pid, signal.SIGKILL)
+        with contextlib.suppress(subprocess.TimeoutExpired):
+            process.wait(timeout=5)
+
+
+def terminate_active_process_groups() -> None:
+    for process_group in tuple(_ACTIVE_PROCESS_GROUPS):
+        with contextlib.suppress(ProcessLookupError):
+            os.killpg(process_group, signal.SIGTERM)
+    deadline = time.monotonic() + 3
+    while _ACTIVE_PROCESS_GROUPS and time.monotonic() < deadline:
+        for process_group in tuple(_ACTIVE_PROCESS_GROUPS):
+            try:
+                os.killpg(process_group, 0)
+            except ProcessLookupError:
+                _ACTIVE_PROCESS_GROUPS.discard(process_group)
+        if _ACTIVE_PROCESS_GROUPS:
+            time.sleep(0.1)
+    for process_group in tuple(_ACTIVE_PROCESS_GROUPS):
+        with contextlib.suppress(ProcessLookupError):
+            os.killpg(process_group, signal.SIGKILL)
+
+
+def handle_signal(signum: int, _frame: object) -> None:
+    signal.signal(signum, signal.SIG_DFL)
+    terminate_active_process_groups()
+    raise SystemExit(128 + signum)
+
+
+def sha256_file(path: Path) -> str:
+    return hashlib.sha256(path.read_bytes()).hexdigest()
+
+
+def implementation_hashes() -> dict[str, str]:
+    relative_files = (
+        "kernel_perf_agent/kernel_opt/diagnose_prompt/gpu_specs_database.py",
+        "kernel_perf_agent/kernel_opt/profiler/ncu_profiler.py",
+        "triton_kernel_agent/agent.py",
+        "triton_kernel_agent/manager.py",
+        "triton_kernel_agent/opt_manager.py",
+        "triton_kernel_agent/opt_worker.py",
+        "triton_kernel_agent/platform/nvidia.py",
+        "triton_kernel_agent/worker.py",
+        "triton_kernel_agent/opt_worker_component/benchmarking/benchmark.py",
+        "triton_kernel_agent/opt_worker_component/profiling/kernel_profiler.py",
+        "triton_kernel_agent/opt_worker_component/searching/history/json_db.py",
+        "utils/providers/__init__.py",
+        "utils/providers/available_models.py",
+        "utils/providers/claude_cli_provider.py",
+    )
+    hashes = {
+        relative: sha256_file(SOURCE_ROOT / relative) for relative in relative_files
+    }
+    hashes["runner/kernelagent_attention_driver.py"] = sha256_file(
+        Path(__file__).resolve()
+    )
+    hashes["runner/sandbox_launcher.sh"] = sha256_file(SANDBOX_LAUNCHER)
+    hashes["runner/shims/dotenv/__init__.py"] = sha256_file(
+        SHIMS_ROOT / "dotenv" / "__init__.py"
+    )
+    hashes["runner/shims/omegaconf/__init__.py"] = sha256_file(
+        SHIMS_ROOT / "omegaconf" / "__init__.py"
+    )
+    return hashes
+
+
+def task_sources(seq_len: int, causal: bool) -> tuple[str, str]:
+    problem = f'''from __future__ import annotations
+
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+
+BATCH = 2
+HEADS = 32
+SEQ_LEN = {seq_len}
+HEAD_DIM = 64
+CAUSAL = {causal!r}
+SEED = {SEED}
+
+
+class Model(nn.Module):
+    def forward(self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor) -> torch.Tensor:
+        with torch.nn.attention.sdpa_kernel(
+            [torch.nn.attention.SDPBackend.CUDNN_ATTENTION]
+        ):
+            return F.scaled_dot_product_attention(q, k, v, is_causal=CAUSAL)
+
+
+def get_inputs():
+    generator = torch.Generator(device="cuda")
+    generator.manual_seed(SEED)
+    shape = (BATCH, HEADS, SEQ_LEN, HEAD_DIM)
+    return [
+        torch.randn(shape, device="cuda", dtype=torch.float16, generator=generator)
+        for _ in range(3)
+    ]
+
+
+def get_init_inputs():
+    return []
+'''
+    test = f'''from __future__ import annotations
+
+import sys
+
+import torch
+import torch.nn.functional as F
+
+from kernel import kernel_function
+
+
+def main() -> None:
+    generator = torch.Generator(device="cuda")
+    generator.manual_seed({SEED})
+    shape = (2, 32, {seq_len}, 64)
+    q, k, v = [
+        torch.randn(shape, device="cuda", dtype=torch.float16, generator=generator)
+        for _ in range(3)
+    ]
+    with torch.nn.attention.sdpa_kernel(
+        [torch.nn.attention.SDPBackend.CUDNN_ATTENTION]
+    ):
+        expected = F.scaled_dot_product_attention(
+            q, k, v, is_causal={causal!r}
+        )
+    actual = kernel_function(q, k, v)
+    if not isinstance(actual, torch.Tensor):
+        raise AssertionError("kernel_function must return one output tensor")
+    if actual.shape != expected.shape or actual.dtype != torch.float16:
+        raise AssertionError(
+            f"bad output metadata: shape={{actual.shape}} dtype={{actual.dtype}}"
+        )
+    torch.testing.assert_close(
+        actual.float(), expected.float(), atol=5e-2, rtol=2e-2
+    )
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except Exception as exc:
+        print(f"FAIL: {{exc}}", file=sys.stderr)
+        raise
+    print("PASS")
+'''
+    return problem, test
+
+
+def configure_environment(run_dir: Path, physical_gpu: int) -> None:
+    source_path = f"{SHIMS_ROOT}:{SOURCE_ROOT}"
+    existing = os.environ.get("PYTHONPATH")
+    os.environ["PYTHONPATH"] = f"{source_path}:{existing}" if existing else source_path
+    os.environ["CUDA_VISIBLE_DEVICES"] = str(physical_gpu)
+    os.environ["KERNELAGENT_ALLOWED_RUN_ROOT"] = str(run_dir)
+    os.environ["KERNELAGENT_SOURCE_ROOT"] = str(SOURCE_ROOT)
+    os.environ["KERNELAGENT_SHIMS_ROOT"] = str(SHIMS_ROOT)
+    os.environ["KERNELAGENT_PHYSICAL_GPU"] = str(physical_gpu)
+    os.environ["KERNELAGENT_TEST_PYTHON"] = str(SANDBOX_LAUNCHER)
+    os.environ["KERNEL_PROFILER_PYTHON"] = str(SANDBOX_LAUNCHER)
+    os.environ["KERNELAGENT_SANDBOX_LAUNCHER"] = str(SANDBOX_LAUNCHER)
+    os.environ["KERNELAGENT_CLAUDE_CWD"] = str(run_dir / "claude-broker")
+    os.environ["KERNELAGENT_CLAUDE_AUDIT_LOG"] = str(run_dir / "claude_audit.jsonl")
+    os.environ["KERNELAGENT_CLAUDE_MAX_BUDGET_USD"] = "10.00"
+    os.environ["KERNELAGENT_CLAUDE_TIMEOUT_S"] = "900"
+    os.environ["TRITON_CACHE_DIR"] = str(run_dir / "host-triton-cache")
+    os.environ["TORCH_EXTENSIONS_DIR"] = str(run_dir / "host-torch-extensions")
+
+
+def generation_phase(run_dir: Path, seq_len: int, causal: bool) -> None:
+    from triton_kernel_agent import TritonKernelAgent
+
+    problem, test = task_sources(seq_len, causal)
+    description = (
+        "Generate a pure Triton, output-only scaled dot-product attention forward "
+        f"kernel for contiguous FP16 Q/K/V with shape [2, 32, {seq_len}, 64]. "
+        f"Causal is {causal}. Use the default scale 1/sqrt(64). The wrapper must "
+        "be named kernel_function(q, k, v). The only reference implementation is:\n\n"
+        + problem
+    )
+    agent = TritonKernelAgent(
+        num_workers=1,
+        max_rounds=3,
+        log_dir=str(run_dir / "generation"),
+        model_name=MODEL,
+        high_reasoning_effort=True,
+        test_timeout_s=GENERATION_TEST_TIMEOUT_S,
+    )
+    result = agent.generate_kernel(
+        problem_description=description,
+        test_code=test,
+        generate_default_test=False,
+    )
+    (run_dir / "generation_result.json").write_text(json.dumps(result, indent=2) + "\n")
+    if not result.get("success"):
+        raise RuntimeError(f"Kernel generation failed: {result}")
+    (run_dir / "seed_kernel.py").write_text(result["kernel_code"])
+
+
+def optimization_phase(run_dir: Path, physical_gpu: int) -> None:
+    from triton_kernel_agent.opt_manager import OptimizationManager
+
+    manager = OptimizationManager(
+        strategy="beam_search",
+        num_workers=4,
+        max_rounds=1000,
+        log_dir=run_dir / "optimization",
+        database_path=run_dir / "optimization" / "program_database.json",
+        strategy_config={"num_top_kernels": 2, "num_bottlenecks": 2},
+        openai_model=MODEL,
+        high_reasoning_effort=True,
+        gpu_ids=[physical_gpu],
+        gpu_name="NVIDIA B200",
+        benchmark_warmup=1000,
+        benchmark_repeat=500,
+        benchmark_timing_method="do_bench",
+        benchmark_dtype="float16",
+        benchmark_compile_reference=False,
+        ncu_timeout_seconds=600,
+        ncu_launch_skip=3,
+        ncu_launch_count=1,
+        use_rag=False,
+    )
+    result = manager.run_optimization(
+        initial_kernel=(run_dir / "seed_kernel.py").read_text(),
+        problem_file=run_dir / "problem.py",
+        test_code=(run_dir / "test_kernel.py").read_text(),
+    )
+    (run_dir / "optimization_result.json").write_text(
+        json.dumps(result, indent=2) + "\n"
+    )
+
+
+def run_phase(command: list[str], log_path: Path, timeout_s: float) -> tuple[int, bool]:
+    with log_path.open("w") as log:
+        previous_mask = signal.pthread_sigmask(
+            signal.SIG_BLOCK, {signal.SIGINT, signal.SIGTERM}
+        )
+        try:
+            process = subprocess.Popen(
+                command_restoring_signal_mask(command, previous_mask),
+                stdout=log,
+                stderr=subprocess.STDOUT,
+                text=True,
+                start_new_session=True,
+                env=os.environ.copy(),
+            )
+            _ACTIVE_PROCESS_GROUPS.add(process.pid)
+        finally:
+            signal.pthread_sigmask(signal.SIG_SETMASK, previous_mask)
+        try:
+            return process.wait(timeout=max(1.0, timeout_s)), False
+        except subprocess.TimeoutExpired:
+            terminate_process_group(process)
+            return process.returncode or -signal.SIGTERM, True
+        finally:
+            _ACTIVE_PROCESS_GROUPS.discard(process.pid)
+
+
+def select_kernel(run_dir: Path) -> tuple[str, dict]:
+    candidates: list[tuple[float, str, dict]] = []
+    seed_path = run_dir / "seed_kernel.py"
+    if seed_path.exists():
+        candidates.append((math.inf, seed_path.read_text(), {"program_id": "seed"}))
+
+    result_path = run_dir / "optimization_result.json"
+    if result_path.exists():
+        result = json.loads(result_path.read_text())
+        if result.get("success") and result.get("kernel_code"):
+            candidates.append(
+                (
+                    float(result["best_time_ms"]),
+                    result["kernel_code"],
+                    {"program_id": "optimization_result"},
+                )
+            )
+
+    db_path = run_dir / "optimization" / "program_database.json"
+    if db_path.exists():
+        try:
+            database = json.loads(db_path.read_text())
+        except json.JSONDecodeError:
+            database = {}
+        for entry in database.get("programs", []):
+            time_ms = float(entry.get("metrics", {}).get("time_ms", math.inf))
+            if entry.get("kernel_code") and math.isfinite(time_ms):
+                candidates.append(
+                    (
+                        time_ms,
+                        entry["kernel_code"],
+                        {
+                            "program_id": entry.get("program_id"),
+                            "parent_id": entry.get("parent_id"),
+                            "generation": entry.get("generation"),
+                            "ptx_hash": entry.get("ptx_hash"),
+                        },
+                    )
+                )
+
+    if not candidates:
+        raise RuntimeError("No verified kernel was produced before the deadline")
+    candidates.sort(key=lambda item: item[0])
+    best_time, kernel_code, metadata = candidates[0]
+    return kernel_code, {"internal_time_ms": best_time, **metadata}
+
+
+def supervisor(args: argparse.Namespace) -> None:
+    run_dir = args.run_dir.resolve()
+    if run_dir.exists():
+        raise RuntimeError(f"Run directory already exists: {run_dir}")
+    run_dir.mkdir(parents=True)
+    configure_environment(run_dir, args.physical_gpu)
+    problem, test = task_sources(args.seq_len, bool(args.causal))
+    (run_dir / "problem.py").write_text(problem)
+    (run_dir / "test_kernel.py").write_text(test)
+
+    power = subprocess.check_output(
+        [
+            "nvidia-smi",
+            "-i",
+            str(args.physical_gpu),
+            "--query-gpu=power.limit",
+            "--format=csv,noheader,nounits",
+        ],
+        text=True,
+    ).strip()
+    if abs(float(power) - 750.0) > 0.5:
+        raise RuntimeError(f"GPU {args.physical_gpu} power limit is {power} W, expected 750 W")
+
+    active_compute_pids = subprocess.check_output(
+        [
+            "nvidia-smi",
+            "-i",
+            str(args.physical_gpu),
+            "--query-compute-apps=pid",
+            "--format=csv,noheader",
+        ],
+        text=True,
+    ).strip()
+    if active_compute_pids:
+        raise RuntimeError(
+            f"GPU {args.physical_gpu} is not idle; active compute PIDs: "
+            f"{active_compute_pids}"
+        )
+
+    manifest = {
+        "kernelagent_commit": subprocess.check_output(
+            ["git", "-C", str(SOURCE_ROOT), "rev-parse", "HEAD"], text=True
+        ).strip(),
+        "model": MODEL,
+        "seq_len": args.seq_len,
+        "causal": bool(args.causal),
+        "physical_gpu": args.physical_gpu,
+        "budget_label": args.budget_label,
+        "budget_seconds": args.budget_seconds,
+        "generation_test_timeout_seconds": GENERATION_TEST_TIMEOUT_S,
+        "seed": SEED,
+        "power_cap_w": 750,
+        "python_version": sys.version.split()[0],
+        "torch_version": importlib.metadata.version("torch"),
+        "triton_version": importlib.metadata.version("triton"),
+        "claude_cli_version": "2.1.220",
+        "implementation_hashes": implementation_hashes(),
+        "start_time_unix": time.time(),
+    }
+    (run_dir / "manifest.json").write_text(json.dumps(manifest, indent=2) + "\n")
+
+    start = time.monotonic()
+    base_command = [sys.executable, str(Path(__file__).resolve())]
+    generation_command = base_command + [
+        "--phase",
+        "generate",
+        "--run-dir",
+        str(run_dir),
+        "--seq-len",
+        str(args.seq_len),
+        "--causal",
+        str(args.causal),
+        "--physical-gpu",
+        str(args.physical_gpu),
+    ]
+    code, generation_timed_out = run_phase(
+        generation_command, run_dir / "generation.log", args.budget_seconds
+    )
+    if code != 0 or generation_timed_out or not (run_dir / "seed_kernel.py").exists():
+        raise RuntimeError(
+            f"Generation failed or exceeded budget: exit={code} timeout={generation_timed_out}"
+        )
+
+    remaining = args.budget_seconds - (time.monotonic() - start)
+    optimization_timed_out = False
+    optimization_code = None
+    if remaining > 1:
+        optimization_command = base_command + [
+            "--phase",
+            "optimize",
+            "--run-dir",
+            str(run_dir),
+            "--physical-gpu",
+            str(args.physical_gpu),
+        ]
+        optimization_code, optimization_timed_out = run_phase(
+            optimization_command, run_dir / "optimization.log", remaining
+        )
+
+    elapsed = time.monotonic() - start
+    kernel_code, selection = select_kernel(run_dir)
+    (run_dir / "selected_kernel.py").write_text(kernel_code)
+    manifest.update(
+        {
+            "elapsed_seconds": elapsed,
+            "generation_exit_code": code,
+            "optimization_exit_code": optimization_code,
+            "optimization_timed_out": optimization_timed_out,
+            "selection": selection,
+            "completed_time_unix": time.time(),
+        }
+    )
+    (run_dir / "manifest.json").write_text(json.dumps(manifest, indent=2) + "\n")
+    print(json.dumps(manifest, indent=2))
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--phase", choices=("supervise", "generate", "optimize"), default="supervise")
+    parser.add_argument("--run-dir", type=Path, required=True)
+    parser.add_argument("--seq-len", type=int)
+    parser.add_argument("--causal", type=int, choices=(0, 1), default=0)
+    parser.add_argument("--physical-gpu", type=int, choices=(6, 7), required=True)
+    parser.add_argument("--budget-seconds", type=float)
+    parser.add_argument("--budget-label", choices=("1x", "2x"))
+    return parser.parse_args()
+
+
+def main() -> None:
+    mp.set_start_method("spawn", force=True)
+    signal.signal(signal.SIGINT, handle_signal)
+    signal.signal(signal.SIGTERM, handle_signal)
+    args = parse_args()
+    run_dir = args.run_dir.resolve()
+    configure_environment(run_dir, args.physical_gpu)
+    if args.phase == "generate":
+        generation_phase(run_dir, args.seq_len, bool(args.causal))
+    elif args.phase == "optimize":
+        optimization_phase(run_dir, args.physical_gpu)
+    else:
+        if args.seq_len is None or args.budget_seconds is None or args.budget_label is None:
+            raise SystemExit("supervise phase requires shape and budget arguments")
+        supervisor(args)
+
+
+if __name__ == "__main__":
+    main()

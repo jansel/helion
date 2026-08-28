@@ -188,3 +188,4 @@ search-path = ["../pytorch"]
 
 [tool.codespell]
 ignore-words = "scripts/dictionary.txt"
+skip = "plots/kernelagent_closed/runs/*/selected_kernel.py.txt"
