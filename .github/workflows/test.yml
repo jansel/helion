@@ -390,6 +390,17 @@ jobs:
             # per-test timeout false-positives on a cold Triton cache and the
             # worker gets killed mid-compile. Give it headroom.
             TIMEOUT=180
+            # Ref-eager (HELION_INTERPRET=1) runs the reference path eagerly,
+            # re-executing every kernel invocation instead of calling a compiled
+            # kernel once, so the heaviest tests take several times longer than
+            # in compiled mode. Under the two A10G xdist workers they drift up to
+            # the 180s cap; the thread timeout method then os._exit()s the worker,
+            # which xdist reports as a crashed worker with no traceback (blaming
+            # whichever, often skipped, test it held). Give ref-eager more
+            # headroom, matching tpu/pallas-interpret.
+            if [[ "${{ matrix.ref-eager }}" == "true" ]]; then
+              TIMEOUT=300
+            fi
           elif [[ "${{ matrix.alias }}" == *mi350x* ]]; then
             # The MI350X runner exposes a single GPU shared by its xdist
             # workers. Autotuning and interleaved-benchmark tests (each timed
